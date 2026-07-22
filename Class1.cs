@@ -1,8 +1,9 @@
 ﻿using System;
 using System.Diagnostics;
-using System.IO.Compression;
 using LegendScenarioAnalyzer;
-using Spectre.Console;
+using Terminal.Gui.App;
+using Terminal.Gui.ViewBase;
+using Terminal.Gui.Views;
 using UmamusumeResponseAnalyzer.Plugin;
 
 [assembly: SharedContextWith("LegendScenarioAnalyzer")]
@@ -16,46 +17,7 @@ namespace AIRedirector
         public string[] Targets => [];
         public string DataDirectory => Path.Combine("PluginData", Name);
 
-        public async Task UpdatePlugin(ProgressContext ctx)
-        {
-            var progress = ctx.AddTask($"[[{Name}]] 更新");
-
-            using var client = new HttpClient();
-            using var resp = await client.GetAsync($"https://api.github.com/repos/URA-Plugins/{Name}/releases/latest");
-            var jo = Newtonsoft.Json.Linq.JObject.Parse(await resp.Content.ReadAsStringAsync());
-
-            var isLatest = ("v" + ((IPlugin)this).Version.ToString()).Equals("v" + jo["tag_name"]?.ToString());
-            if (isLatest)
-            {
-                progress.Increment(progress.MaxValue);
-                progress.StopTask();
-                return;
-            }
-            progress.Increment(25);
-
-            var downloadUrl = jo["assets"]![0]!["browser_download_url"]!.ToString();
-            using var msg = await client.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead);
-            using var memoryStream = new MemoryStream();
-            await using var stream = await msg.Content.ReadAsStreamAsync();
-            var buffer = new byte[8192];
-            while (true)
-            {
-                var read = await stream.ReadAsync(buffer);
-                if (read == 0)
-                    break;
-                memoryStream.Write(buffer, 0, read);
-                if (msg.Content.Headers.ContentLength is { } contentLength and > 0)
-                    progress.Increment((double)read / contentLength * 50);
-            }
-            memoryStream.Position = 0;
-            using var archive = new ZipArchive(memoryStream);
-            archive.ExtractToDirectory(Path.Combine("Plugins", Name), true);
-            progress.Increment(25);
-
-            progress.StopTask();
-        }
-
-        readonly Dictionary<ScenarioType, Process> Processes = [];
+        readonly Dictionary<ScenarioType, Process> processes = [];
         ChildProcessManager? _childProcessManager;
         AIRedirectorConfig config = new();
         IDisposable? startedSubscription;
@@ -102,15 +64,8 @@ namespace AIRedirector
                 uaf.OutputDataReceived += (sender, e) =>
                 {
                     rawOutput.AppendLine(e.Data);
-                    if (gameStarted && !string.IsNullOrEmpty(e.Data))
-                    {
-                        if (e.Data.Contains("运气指标") || e.Data.Contains("相谈"))
-                        {
-                            Console.WriteLine(e.Data);
-                        }
-                    }
                 };
-                Processes.Add(ScenarioType.UAF, uaf);
+                processes.Add(ScenarioType.UAF, uaf);
                 Trace.WriteLine($"UAF Path: {config.UAF_Path}");
             }
             if (config.Cook)
@@ -122,19 +77,8 @@ namespace AIRedirector
                 cook.OutputDataReceived += (sender, e) =>
                 {
                     rawOutput.AppendLine(e.Data);
-                    if (gameStarted && !string.IsNullOrEmpty(e.Data))
-                    {
-                        if (e.Data.Contains("手写逻辑")
-                            || e.Data.Contains("蒙特卡洛")
-                            || e.Data.Contains("运气指标")
-                            || (e.Data.Contains("速:") && e.Data.Contains("| 休息:"))
-                            || e.Data.Contains("先做料理"))
-                        {
-                            Console.WriteLine(e.Data);
-                        }
-                    }
                 };
-                Processes.Add(ScenarioType.Cook, cook);
+                processes.Add(ScenarioType.Cook, cook);
                 Trace.WriteLine($"Cook Path: {config.Cook_Path}");
             }
             if (config.Mecha)
@@ -146,20 +90,8 @@ namespace AIRedirector
                 mecha.OutputDataReceived += (sender, e) =>
                 {
                     rawOutput.AppendLine(e.Data);
-                    if (gameStarted && !string.IsNullOrEmpty(e.Data))
-                    {
-                        if (e.Data.Contains("手写逻辑")
-                            || e.Data.Contains("蒙特卡洛")
-                            || e.Data.Contains("运气指标")
-                            || (e.Data.Contains("速:") && e.Data.Contains("| 休息:"))
-                            || e.Data.Contains("开启齿轮")
-                            || e.Data.Contains("级胸"))
-                        {
-                            Console.WriteLine(e.Data);
-                        }
-                    }
                 };
-                Processes.Add(ScenarioType.Mecha, mecha);
+                processes.Add(ScenarioType.Mecha, mecha);
                 Trace.WriteLine($"Mecha Path: {config.Mecha_Path}");
             }
             if (config.Legend)
@@ -177,12 +109,12 @@ namespace AIRedirector
                             legendOutput.ApplyCurrentDisplay();
                     }
                 };
-                Processes.Add(ScenarioType.Legend, legend);
+                processes.Add(ScenarioType.Legend, legend);
                 Trace.WriteLine($"Legend Path: {config.Legend_Path}");
             }
 
             _childProcessManager = new ChildProcessManager();
-            foreach (var (_, process) in Processes)
+            foreach (var (_, process) in processes)
             {
                 process.Start();
                 _childProcessManager.AddProcess(process);
@@ -203,37 +135,89 @@ namespace AIRedirector
         {
             Directory.CreateDirectory(DataDirectory);
             config = AIRedirectorConfig.Load(ConfigPath);
-            ConfigureScenario("UAF", value => config.UAF = value, () => config.UAF, value => config.UAF_Path = value, () => config.UAF_Path);
-            ConfigureScenario("Cook", value => config.Cook = value, () => config.Cook, value => config.Cook_Path = value, () => config.Cook_Path);
-            ConfigureScenario("Mecha", value => config.Mecha = value, () => config.Mecha, value => config.Mecha_Path = value, () => config.Mecha_Path);
-            ConfigureScenario("Legend", value => config.Legend = value, () => config.Legend, value => config.Legend_Path = value, () => config.Legend_Path);
-            config.Save(ConfigPath);
+            using IApplication app = Application.Create();
+            app.Init();
+            using var dialog = new Dialog
+            {
+                Title = "AIRedirector 配置",
+                Width = 88,
+                Height = 16,
+            };
+            var scenarios = new[]
+            {
+                CreateScenarioRow("UAF", config.UAF, config.UAF_Path, 1),
+                CreateScenarioRow("Cook", config.Cook, config.Cook_Path, 3),
+                CreateScenarioRow("Mecha", config.Mecha, config.Mecha_Path, 5),
+                CreateScenarioRow("Legend", config.Legend, config.Legend_Path, 7),
+            };
+            foreach (var scenario in scenarios)
+                dialog.Add(scenario.Enabled, scenario.Path);
+
+            var accepted = false;
+            var save = new Button { Text = "保存", IsDefault = true };
+            save.Accepting += (_, e) =>
+            {
+                accepted = true;
+                app.RequestStop(dialog);
+                e.Handled = true;
+            };
+            var cancel = new Button { Text = "取消" };
+            cancel.Accepting += (_, e) =>
+            {
+                app.RequestStop(dialog);
+                e.Handled = true;
+            };
+            dialog.AddButton(cancel);
+            dialog.AddButton(save);
+            app.Run(dialog);
+
+            if (accepted)
+            {
+                config.UAF = scenarios[0].IsEnabled;
+                config.UAF_Path = scenarios[0].Path.Text;
+                config.Cook = scenarios[1].IsEnabled;
+                config.Cook_Path = scenarios[1].Path.Text;
+                config.Mecha = scenarios[2].IsEnabled;
+                config.Mecha_Path = scenarios[2].Path.Text;
+                config.Legend = scenarios[3].IsEnabled;
+                config.Legend_Path = scenarios[3].Path.Text;
+                config.Save(ConfigPath);
+            }
             return Task.CompletedTask;
         }
 
-        static void ConfigureScenario(
-            string name,
-            Action<bool> setEnabled,
-            Func<bool> getEnabled,
-            Action<string> setPath,
-            Func<string> getPath)
+        static ScenarioRow CreateScenarioRow(string name, bool enabled, string path, int y)
         {
-            var enabled = AnsiConsole.Confirm($"启用 {name} AI 输出转发？", getEnabled());
-            setEnabled(enabled);
-            if (!enabled)
-                return;
+            var enabledView = new CheckBox
+            {
+                X = 1,
+                Y = y,
+                Text = $"启用 {name}",
+                Value = enabled ? CheckState.Checked : CheckState.UnChecked,
+            };
+            var pathView = new TextField
+            {
+                X = 18,
+                Y = y,
+                Width = Dim.Fill(1),
+                Text = path,
+                Enabled = enabled,
+            };
+            enabledView.ValueChanged += (_, _) => pathView.Enabled = enabledView.Value == CheckState.Checked;
+            return new(enabledView, pathView);
+        }
 
-            setPath(AnsiConsole.Prompt(
-                new TextPrompt<string>($"{name} AI 程序路径")
-                    .DefaultValue(getPath())
-                    .AllowEmpty()));
+        sealed record ScenarioRow(CheckBox Enabled, TextField Path)
+        {
+            public bool IsEnabled => Enabled.Value == CheckState.Checked;
         }
 
         public void Dispose()
         {
             startedSubscription?.Dispose();
             startedSubscription = null;
-            foreach (var (_, process) in Processes)
+            rawOutput.Dispose();
+            foreach (var (_, process) in processes)
             {
                 if (!process.HasExited)
                 {
@@ -241,7 +225,7 @@ namespace AIRedirector
                 }
                 process.Dispose();
             }
-            Processes.Clear();
+            processes.Clear();
             _childProcessManager?.Dispose();
             _childProcessManager = null;
         }

@@ -1,6 +1,5 @@
 using System.Text.RegularExpressions;
 using LegendScenarioAnalyzer;
-using Spectre.Console;
 
 namespace AIRedirector;
 
@@ -127,8 +126,7 @@ internal sealed class LegendAiOutputBuffer
         {
             if (isTraining)
             {
-                display.Training.Modify(train, card =>
-                    card.AddMarkup($"[grey]AI评分: {Markup.Escape(score)}[/]"));
+                display.Training.Modify(train, card => card.AddText($"AI评分: {score}"));
             }
             else
             {
@@ -144,13 +142,12 @@ internal sealed class LegendAiOutputBuffer
 
         if (recommendation is { } recommendationLine)
         {
-            var escaped = Markup.Escape(recommendationLine);
             if (isTraining && recommendedTrain is { } train)
             {
                 display.Training.Modify(train, card =>
                 {
-                    card.SetBorder(Color.Yellow);
-                    card.AddMarkup($"[yellow]{escaped}[/]");
+                    card.Highlight();
+                    card.AddText(recommendationLine);
                 });
             }
             else
@@ -164,18 +161,16 @@ internal sealed class LegendAiOutputBuffer
     {
         foreach (var (selection, score) in selectionScores.OrderBy(x => x.Key.Color).ThenBy(x => x.Key.OrdinalWithinColor))
         {
-            TryModifySelection(display, selection, card =>
-                card.AddMarkup($"[grey]AI评分: {Markup.Escape(score)}[/]"));
+            TryModifySelection(display, selection, card => card.AddText($"AI评分: {score}"));
         }
 
         if (recommendation is { } recommendationLine)
         {
-            var escaped = Markup.Escape(recommendationLine);
             if (recommendedSelection is { } selection
                 && TryModifySelection(display, selection, card =>
                 {
-                    card.SetBorder(Color.Yellow);
-                    card.AddMarkup($"[yellow]{escaped}[/]");
+                    card.Highlight();
+                    card.AddText(recommendationLine);
                 }))
             {
                 return;
@@ -374,11 +369,10 @@ internal sealed class LegendAiOutputBuffer
         LegendTrainingDisplayEditor display,
         string recommendationLine)
     {
-        var escaped = Markup.Escape(recommendationLine);
         if (IsImportantRecommendation(recommendationLine))
-            display.Important.AddMarkup($"[yellow]{escaped}[/]");
+            display.Important.AddText(recommendationLine);
         else
-            display.Extra.AddMarkup($"[yellow]{escaped}[/]");
+            display.Extra.AddText(recommendationLine);
     }
 
     static bool IsImportantRecommendation(string recommendationLine)
