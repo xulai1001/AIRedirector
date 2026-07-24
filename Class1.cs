@@ -131,12 +131,44 @@ namespace AIRedirector
                 throw new FileNotFoundException($"{name} AI 已启用，但配置的程序路径不存在: {path}", path);
         }
 
-        public Task ConfigPromptAsync()
+        public async Task ConfigPromptAsync(
+            IApplication application,
+            CancellationToken cancellationToken = default)
         {
-            Directory.CreateDirectory(DataDirectory);
-            config = AIRedirectorConfig.Load(ConfigPath);
-            using IApplication app = Application.Create();
-            app.Init();
+            ArgumentNullException.ThrowIfNull(application);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (application.TopRunnable is null &&
+                Environment.CurrentManagedThreadId != application.MainThreadId)
+                throw new InvalidOperationException(
+                    "AIRedirector 无法从非 UI thread 启动配置：Terminal.Gui 当前没有正在运行的 session。");
+
+            var draft = AIRedirectorConfig.Load(ConfigPath);
+            var completion = new TaskCompletionSource<AIRedirectorConfig>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            application.Invoke(() =>
+            {
+                try
+                {
+                    completion.SetResult(RunConfigDialog(application, draft, cancellationToken));
+                }
+                catch (Exception ex)
+                {
+                    completion.SetException(ex);
+                }
+            });
+
+            var saved = await completion.Task;
+            cancellationToken.ThrowIfCancellationRequested();
+            saved.Save(ConfigPath);
+            config = saved;
+        }
+
+        static AIRedirectorConfig RunConfigDialog(
+            IApplication application,
+            AIRedirectorConfig draft,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             using var dialog = new Dialog
             {
                 Title = "AIRedirector 配置",
@@ -145,10 +177,10 @@ namespace AIRedirector
             };
             var scenarios = new[]
             {
-                CreateScenarioRow("UAF", config.UAF, config.UAF_Path, 1),
-                CreateScenarioRow("Cook", config.Cook, config.Cook_Path, 3),
-                CreateScenarioRow("Mecha", config.Mecha, config.Mecha_Path, 5),
-                CreateScenarioRow("Legend", config.Legend, config.Legend_Path, 7),
+                CreateScenarioRow("UAF", draft.UAF, draft.UAF_Path, 1),
+                CreateScenarioRow("Cook", draft.Cook, draft.Cook_Path, 3),
+                CreateScenarioRow("Mecha", draft.Mecha, draft.Mecha_Path, 5),
+                CreateScenarioRow("Legend", draft.Legend, draft.Legend_Path, 7),
             };
             foreach (var scenario in scenarios)
                 dialog.Add(scenario.Enabled, scenario.Path);
@@ -158,32 +190,35 @@ namespace AIRedirector
             save.Accepting += (_, e) =>
             {
                 accepted = true;
-                app.RequestStop(dialog);
+                application.RequestStop(dialog);
                 e.Handled = true;
             };
             var cancel = new Button { Text = "取消" };
             cancel.Accepting += (_, e) =>
             {
-                app.RequestStop(dialog);
+                application.RequestStop(dialog);
                 e.Handled = true;
             };
             dialog.AddButton(cancel);
             dialog.AddButton(save);
-            app.Run(dialog);
+            using (cancellationToken.Register(
+                       () => application.Invoke(() => application.RequestStop(dialog))))
+                application.Run(dialog);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!accepted)
+                throw new OperationCanceledException("AIRedirector 配置已取消。", cancellationToken);
 
-            if (accepted)
+            return new()
             {
-                config.UAF = scenarios[0].IsEnabled;
-                config.UAF_Path = scenarios[0].Path.Text;
-                config.Cook = scenarios[1].IsEnabled;
-                config.Cook_Path = scenarios[1].Path.Text;
-                config.Mecha = scenarios[2].IsEnabled;
-                config.Mecha_Path = scenarios[2].Path.Text;
-                config.Legend = scenarios[3].IsEnabled;
-                config.Legend_Path = scenarios[3].Path.Text;
-                config.Save(ConfigPath);
-            }
-            return Task.CompletedTask;
+                UAF = scenarios[0].IsEnabled,
+                UAF_Path = scenarios[0].Path.Text,
+                Cook = scenarios[1].IsEnabled,
+                Cook_Path = scenarios[1].Path.Text,
+                Mecha = scenarios[2].IsEnabled,
+                Mecha_Path = scenarios[2].Path.Text,
+                Legend = scenarios[3].IsEnabled,
+                Legend_Path = scenarios[3].Path.Text,
+            };
         }
 
         static ScenarioRow CreateScenarioRow(string name, bool enabled, string path, int y)
