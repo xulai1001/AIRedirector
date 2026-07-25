@@ -238,6 +238,7 @@ namespace AIRedirector
                 Text = path,
                 Enabled = enabled,
             };
+            pathView.MouseHighlightStates |= MouseState.In;
             enabledView.ValueChanged += (_, _) => pathView.Enabled = enabledView.Value == CheckState.Checked;
             return new(enabledView, pathView);
         }
