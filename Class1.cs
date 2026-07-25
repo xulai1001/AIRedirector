@@ -143,21 +143,29 @@ namespace AIRedirector
                     "AIRedirector 无法从非 UI thread 启动配置：Terminal.Gui 当前没有正在运行的 session。");
 
             var draft = AIRedirectorConfig.Load(ConfigPath);
-            var completion = new TaskCompletionSource<AIRedirectorConfig>(
-                TaskCreationOptions.RunContinuationsAsynchronously);
-            application.Invoke(() =>
+            AIRedirectorConfig saved;
+            if (Environment.CurrentManagedThreadId == application.MainThreadId)
             {
-                try
+                saved = RunConfigDialog(application, draft, cancellationToken);
+            }
+            else
+            {
+                var completion = new TaskCompletionSource<AIRedirectorConfig>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                application.Invoke(() =>
                 {
-                    completion.SetResult(RunConfigDialog(application, draft, cancellationToken));
-                }
-                catch (Exception ex)
-                {
-                    completion.SetException(ex);
-                }
-            });
+                    try
+                    {
+                        completion.SetResult(RunConfigDialog(application, draft, cancellationToken));
+                    }
+                    catch (Exception ex)
+                    {
+                        completion.SetException(ex);
+                    }
+                });
+                saved = await completion.Task;
+            }
 
-            var saved = await completion.Task;
             cancellationToken.ThrowIfCancellationRequested();
             saved.Save(ConfigPath);
             config = saved;
