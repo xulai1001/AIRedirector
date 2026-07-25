@@ -168,25 +168,145 @@ namespace AIRedirector
             AIRedirectorConfig draft,
             CancellationToken cancellationToken)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var action = RunConfigMenu(application, draft, cancellationToken);
+                if (action == ConfigAction.Save)
+                    return draft;
+                if (action == ConfigAction.Cancel)
+                    throw new OperationCanceledException("AIRedirector 配置已取消。", cancellationToken);
+
+                var (scenario, path) = action switch
+                {
+                    ConfigAction.EditUaf => ("UAF", draft.UAF_Path),
+                    ConfigAction.EditCook => ("Cook", draft.Cook_Path),
+                    ConfigAction.EditMecha => ("Mecha", draft.Mecha_Path),
+                    ConfigAction.EditLegend => ("Legend", draft.Legend_Path),
+                    _ => throw new UnreachableException(),
+                };
+                var edited = RunPathDialog(
+                    application,
+                    scenario,
+                    path,
+                    cancellationToken);
+                if (edited is null)
+                    continue;
+
+                switch (action)
+                {
+                    case ConfigAction.EditUaf:
+                        draft.UAF_Path = edited;
+                        break;
+                    case ConfigAction.EditCook:
+                        draft.Cook_Path = edited;
+                        break;
+                    case ConfigAction.EditMecha:
+                        draft.Mecha_Path = edited;
+                        break;
+                    case ConfigAction.EditLegend:
+                        draft.Legend_Path = edited;
+                        break;
+                }
+            }
+        }
+
+        static ConfigAction RunConfigMenu(
+            IApplication application,
+            AIRedirectorConfig draft,
+            CancellationToken cancellationToken)
+        {
             using var dialog = new Dialog
             {
                 Title = "AIRedirector 配置",
                 Width = 88,
-                Height = 16,
+                Height = 14,
             };
-            var scenarios = new[]
+            var action = ConfigAction.Cancel;
+            var items = new List<MenuItem>();
+
+            void AddScenario(
+                string name,
+                bool enabled,
+                string path,
+                Action<bool> setEnabled,
+                ConfigAction editAction)
             {
-                CreateScenarioRow("UAF", draft.UAF, draft.UAF_Path, 1),
-                CreateScenarioRow("Cook", draft.Cook, draft.Cook_Path, 3),
-                CreateScenarioRow("Mecha", draft.Mecha, draft.Mecha_Path, 5),
-                CreateScenarioRow("Legend", draft.Legend, draft.Legend_Path, 7),
+                var checkBox = new CheckBox
+                {
+                    Text = $"启用 {name}",
+                    Value = enabled ? CheckState.Checked : CheckState.UnChecked,
+                    CanFocus = false,
+                };
+                var pathItem = new MenuItem
+                {
+                    Title = $"{name} 路径",
+                    HelpText = path,
+                    Enabled = enabled,
+                    Action = () =>
+                    {
+                        action = editAction;
+                        application.RequestStop(dialog);
+                    },
+                };
+                checkBox.ValueChanged += (_, _) =>
+                {
+                    var isEnabled = checkBox.Value == CheckState.Checked;
+                    setEnabled(isEnabled);
+                    pathItem.Enabled = isEnabled;
+                };
+                items.Add(new MenuItem { CommandView = checkBox });
+                items.Add(pathItem);
+            }
+
+            AddScenario("UAF", draft.UAF, draft.UAF_Path, value => draft.UAF = value, ConfigAction.EditUaf);
+            AddScenario("Cook", draft.Cook, draft.Cook_Path, value => draft.Cook = value, ConfigAction.EditCook);
+            AddScenario("Mecha", draft.Mecha, draft.Mecha_Path, value => draft.Mecha = value, ConfigAction.EditMecha);
+            AddScenario("Legend", draft.Legend, draft.Legend_Path, value => draft.Legend = value, ConfigAction.EditLegend);
+            items.Add(new MenuItem("保存", action: () =>
+            {
+                action = ConfigAction.Save;
+                application.RequestStop(dialog);
+            }));
+            items.Add(new MenuItem("取消", action: () => application.RequestStop(dialog)));
+
+            var menu = new Menu(items)
+            {
+                Width = Dim.Fill(),
+                Height = Dim.Fill(),
             };
-            foreach (var scenario in scenarios)
-                dialog.Add(scenario.Enabled, scenario.Path);
+            dialog.Add(menu);
+            items[0].SetFocus();
+            using (cancellationToken.Register(
+                       () => application.Invoke(() => application.RequestStop(dialog))))
+                application.Run(dialog);
+            cancellationToken.ThrowIfCancellationRequested();
+            return action;
+        }
+
+        static string? RunPathDialog(
+            IApplication application,
+            string scenario,
+            string path,
+            CancellationToken cancellationToken)
+        {
+            using var dialog = new Dialog
+            {
+                Title = $"{scenario} 路径",
+                Width = 88,
+                Height = 7,
+            };
+            var label = new Label { Text = "UmaAI.exe 路径" };
+            var field = new TextField
+            {
+                Y = 1,
+                Width = Dim.Fill(),
+                Text = path,
+            };
+            dialog.Add(label, field);
 
             var accepted = false;
-            var save = new Button { Text = "保存", IsDefault = true };
+            var save = new Button { Text = "确定", IsDefault = true };
             save.Accepting += (_, e) =>
             {
                 accepted = true;
@@ -201,51 +321,22 @@ namespace AIRedirector
             };
             dialog.AddButton(cancel);
             dialog.AddButton(save);
+            field.SetFocus();
             using (cancellationToken.Register(
                        () => application.Invoke(() => application.RequestStop(dialog))))
                 application.Run(dialog);
             cancellationToken.ThrowIfCancellationRequested();
-            if (!accepted)
-                throw new OperationCanceledException("AIRedirector 配置已取消。", cancellationToken);
-
-            return new()
-            {
-                UAF = scenarios[0].IsEnabled,
-                UAF_Path = scenarios[0].Path.Text,
-                Cook = scenarios[1].IsEnabled,
-                Cook_Path = scenarios[1].Path.Text,
-                Mecha = scenarios[2].IsEnabled,
-                Mecha_Path = scenarios[2].Path.Text,
-                Legend = scenarios[3].IsEnabled,
-                Legend_Path = scenarios[3].Path.Text,
-            };
+            return accepted ? field.Text : null;
         }
 
-        static ScenarioRow CreateScenarioRow(string name, bool enabled, string path, int y)
+        enum ConfigAction
         {
-            var enabledView = new CheckBox
-            {
-                X = 1,
-                Y = y,
-                Text = $"启用 {name}",
-                Value = enabled ? CheckState.Checked : CheckState.UnChecked,
-            };
-            var pathView = new TextField
-            {
-                X = 18,
-                Y = y,
-                Width = Dim.Fill(1),
-                Text = path,
-                Enabled = enabled,
-            };
-            pathView.MouseHighlightStates |= MouseState.In;
-            enabledView.ValueChanged += (_, _) => pathView.Enabled = enabledView.Value == CheckState.Checked;
-            return new(enabledView, pathView);
-        }
-
-        sealed record ScenarioRow(CheckBox Enabled, TextField Path)
-        {
-            public bool IsEnabled => Enabled.Value == CheckState.Checked;
+            Cancel,
+            Save,
+            EditUaf,
+            EditCook,
+            EditMecha,
+            EditLegend,
         }
 
         public void Dispose()
