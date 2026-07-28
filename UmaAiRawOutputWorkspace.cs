@@ -24,7 +24,6 @@ internal sealed class UmaAiRawOutputWorkspace : IDisposable
         lock (gate)
         {
             liveDisplay = output;
-            workspace = output.CreateWorkspace(WorkspaceTitle);
         }
     }
 
@@ -35,9 +34,10 @@ internal sealed class UmaAiRawOutputWorkspace : IDisposable
 
         lock (gate)
         {
-            if (liveDisplay is not { } output || workspace is not { } target)
+            if (liveDisplay is not { } output)
                 return;
 
+            var target = workspace ??= output.CreateWorkspace(WorkspaceTitle);
             lines.Add(line);
             if (lines.Count > MaxLines)
                 lines.RemoveRange(0, lines.Count - MaxLines);
