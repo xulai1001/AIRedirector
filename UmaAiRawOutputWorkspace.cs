@@ -1,6 +1,6 @@
 using System.Text;
 using System.Text.RegularExpressions;
-using UmamusumeResponseAnalyzer.LiveDisplay;
+using UmamusumeResponseAnalyzer.TerminalGui;
 
 namespace AIRedirector;
 
@@ -15,64 +15,80 @@ internal sealed class UmaAiRawOutputWorkspace : IDisposable
         RegexOptions.Compiled);
 
     readonly object gate = new();
+    readonly SemaphoreSlim publishGate = new(1, 1);
     readonly List<string> lines = [];
-    ILiveDisplayOutput? liveDisplay;
-    LiveDisplayWorkspace? workspace;
+    Workspace? workspace;
+    long nextSequence;
+    long latestPublishSequence;
 
-    public void Initialize(ILiveDisplayOutput output)
-    {
-        lock (gate)
-        {
-            liveDisplay = output;
-        }
-    }
-
-    public void AppendLine(string? line)
+    public (long Sequence, string Text)? AppendLine(string? line)
     {
         if (line is null)
-            return;
+            return null;
 
         lock (gate)
         {
-            if (liveDisplay is not { } output)
-                return;
-
-            var target = workspace ??= output.CreateWorkspace(WorkspaceTitle);
             lines.Add(line);
             if (lines.Count > MaxLines)
                 lines.RemoveRange(0, lines.Count - MaxLines);
-
-            output.SetPanel(
-                target,
-                PanelKey,
-                PanelTitle,
-                LiveDisplayContent.Text(Render()),
-                fullBleed: true,
-                switchToWorkspace: false);
+            return (++nextSequence, Render());
         }
+    }
+
+    public void WaitToPublish()
+        => publishGate.Wait();
+
+    public void ReleasePublish()
+        => publishGate.Release();
+
+    public bool Publish((long Sequence, string Text) snapshot)
+    {
+        lock (gate)
+        {
+            if (snapshot.Sequence <= latestPublishSequence)
+                return false;
+        }
+
+        var target = Workspace.Create(WorkspaceTitle);
+        target.SetPanel(
+            PanelKey,
+            PanelTitle,
+            WorkspaceContent.Text(snapshot.Text),
+            fullBleed: true,
+            switchToWorkspace: false);
+
+        lock (gate)
+        {
+            latestPublishSequence = snapshot.Sequence;
+            workspace = target;
+        }
+        return true;
     }
 
     string Render()
-        => string.Join(Environment.NewLine, lines.Select(SanitizeForLiveDisplay));
+        => string.Join(Environment.NewLine, lines.Select(SanitizeForWorkspace));
 
     public void Dispose()
     {
-        ILiveDisplayOutput? output;
-        LiveDisplayWorkspace? target;
+        Workspace? target;
         lock (gate)
         {
-            output = liveDisplay;
             target = workspace;
-            liveDisplay = null;
-            workspace = null;
             lines.Clear();
         }
 
-        if (output is not null && target is not null)
-            output.RemoveWorkspace(target);
+        if (target is null)
+            return;
+
+        target.RemovePanel(PanelKey);
+        lock (gate)
+        {
+            if (ReferenceEquals(workspace, target))
+                workspace = null;
+        }
     }
 
-    static string SanitizeForLiveDisplay(string line)
+    static string SanitizeForWorkspace(string line)
     {
         var withoutTerminalSequences = TerminalControlSequencePattern.Replace(line, string.Empty);
         var text = new StringBuilder(withoutTerminalSequences.Length);

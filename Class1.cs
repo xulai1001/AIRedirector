@@ -12,114 +12,270 @@ namespace AIRedirector
 {
     public class AIRedirector : IPlugin
     {
+        const int ProcessExitWaitMilliseconds = 5000;
+
         public string Name => "AIRedirector";
         public string Author => "离披";
         public string[] Targets => [];
         public string DataDirectory => Path.Combine("PluginData", Name);
 
-        readonly Dictionary<ScenarioType, Process> processes = [];
+        readonly List<Process> createdProcesses = [];
+        readonly List<Process> startedProcesses = [];
         ChildProcessManager? _childProcessManager;
         AIRedirectorConfig config = new();
         IDisposable? startedSubscription;
+        readonly object processOutputGate = new();
         readonly LegendAiOutputBuffer legendOutput = new();
         readonly UmaAiRawOutputWorkspace rawOutput = new();
+        readonly Queue<(long Generation, string Line)> pendingLegendOutput = [];
+        TaskCompletionSource<object?>? outputPublishingDrained;
+        TaskCompletionSource<Exception?>? cleanupInProgress;
+        long outputGeneration;
+        int publishingOutput;
+        bool legendWorkerScheduled;
+        bool acceptingProcessOutput;
         bool gameStarted;
 
         string ConfigPath => Path.Combine(DataDirectory, "settings.json");
 
         public void Initialize(IPluginContext context)
         {
-            Directory.CreateDirectory(DataDirectory);
-            rawOutput.Initialize(context.LiveDisplay);
-            config = AIRedirectorConfig.Load(ConfigPath);
-            startedSubscription = context.Events.OnStarted(_ =>
+            lock (processOutputGate)
             {
-                gameStarted = true;
-                return ValueTask.CompletedTask;
-            });
+                acceptingProcessOutput = true;
+                outputGeneration++;
+            }
 
-            var sendGameStatusDataDirectory = Path.Combine("PluginData", "SendGameStatusPlugin");
-            if (Directory.Exists(sendGameStatusDataDirectory))
+            try
             {
-                foreach (var i in Directory.EnumerateFiles(sendGameStatusDataDirectory, "*.json", SearchOption.AllDirectories))
+                Directory.CreateDirectory(DataDirectory);
+                config = AIRedirectorConfig.Load(ConfigPath);
+                var subscription = context.Events.OnStarted(_ =>
                 {
-                    if (Path.GetFileName(i) == "thisTurn.json")
+                    Volatile.Write(ref gameStarted, true);
+                    return ValueTask.CompletedTask;
+                });
+                lock (processOutputGate)
+                    startedSubscription = subscription;
+
+                var sendGameStatusDataDirectory = Path.Combine("PluginData", "SendGameStatusPlugin");
+                if (Directory.Exists(sendGameStatusDataDirectory))
+                {
+                    foreach (var i in Directory.EnumerateFiles(sendGameStatusDataDirectory, "*.json", SearchOption.AllDirectories))
                     {
-                        File.WriteAllText(i, "{}");
+                        if (Path.GetFileName(i) == "thisTurn.json")
+                        {
+                            File.WriteAllText(i, "{}");
+                        }
                     }
+                }
+
+                ValidateConfiguredPath("UAF", config.UAF, config.UAF_Path);
+                ValidateConfiguredPath("Cook", config.Cook, config.Cook_Path);
+                ValidateConfiguredPath("Mecha", config.Mecha, config.Mecha_Path);
+                ValidateConfiguredPath("Legend", config.Legend, config.Legend_Path);
+
+                if (config.UAF)
+                    Trace.WriteLine($"UAF Path: {config.UAF_Path}");
+                if (config.Cook)
+                    Trace.WriteLine($"Cook Path: {config.Cook_Path}");
+                if (config.Mecha)
+                    Trace.WriteLine($"Mecha Path: {config.Mecha_Path}");
+                if (config.Legend)
+                    Trace.WriteLine($"Legend Path: {config.Legend_Path}");
+
+                var manager = new ChildProcessManager();
+                lock (processOutputGate)
+                    _childProcessManager = manager;
+
+                if (config.UAF)
+                    StartProcess(manager, "UAF", config.UAF_Path);
+                if (config.Cook)
+                    StartProcess(manager, "Cook", config.Cook_Path);
+                if (config.Mecha)
+                    StartProcess(manager, "Mecha", config.Mecha_Path);
+                if (config.Legend)
+                    StartProcess(manager, "Legend", config.Legend_Path, applyToLegend: true);
+            }
+            catch (Exception initializationException)
+            {
+                try
+                {
+                    Dispose();
+                }
+                catch (Exception cleanupException)
+                {
+                    throw new AggregateException(
+                        "AIRedirector 初始化与回滚均失败。",
+                        initializationException,
+                        cleanupException);
+                }
+
+                throw;
+            }
+        }
+
+        void StartProcess(
+            ChildProcessManager manager,
+            string name,
+            string path,
+            bool applyToLegend = false)
+        {
+            var process = new Process
+            {
+                StartInfo = UmaAiProcessStartInfo.Create(path)
+            };
+            process.OutputDataReceived += (_, e) => HandleOutput(e.Data, applyToLegend);
+            lock (processOutputGate)
+                createdProcesses.Add(process);
+
+            if (!process.Start())
+                throw new InvalidOperationException($"无法启动 {name} AI 进程: {path}");
+
+            lock (processOutputGate)
+                startedProcesses.Add(process);
+
+            manager.AddProcess(process);
+            process.BeginOutputReadLine();
+        }
+
+        void HandleOutput(string? line, bool applyToLegend = false)
+        {
+            long callbackGeneration;
+            lock (processOutputGate)
+            {
+                if (!acceptingProcessOutput)
+                    return;
+
+                callbackGeneration = outputGeneration;
+            }
+
+            var snapshot = rawOutput.AppendLine(line);
+            var updateLegend = applyToLegend &&
+                Volatile.Read(ref gameStarted) &&
+                !string.IsNullOrEmpty(line);
+            if (snapshot is null)
+                return;
+
+            rawOutput.WaitToPublish();
+            try
+            {
+                if (!TryBeginOutputPublish(callbackGeneration))
+                    return;
+
+                var rawPublished = false;
+                try
+                {
+                    rawPublished = rawOutput.Publish(snapshot.Value);
+                }
+                finally
+                {
+                    EndOutputPublish();
+                }
+
+                if (rawPublished && updateLegend)
+                    EnqueueLegendOutput(callbackGeneration, line!);
+            }
+            finally
+            {
+                rawOutput.ReleasePublish();
+            }
+        }
+
+        void EnqueueLegendOutput(long callbackGeneration, string line)
+        {
+            var scheduleWorker = false;
+            lock (processOutputGate)
+            {
+                if (!acceptingProcessOutput || outputGeneration != callbackGeneration)
+                    return;
+
+                pendingLegendOutput.Enqueue((callbackGeneration, line));
+                if (!legendWorkerScheduled)
+                {
+                    legendWorkerScheduled = true;
+                    scheduleWorker = true;
                 }
             }
 
-            ValidateConfiguredPath("UAF", config.UAF, config.UAF_Path);
-            ValidateConfiguredPath("Cook", config.Cook, config.Cook_Path);
-            ValidateConfiguredPath("Mecha", config.Mecha, config.Mecha_Path);
-            ValidateConfiguredPath("Legend", config.Legend, config.Legend_Path);
+            if (scheduleWorker)
+                ScheduleLegendOutputWorker();
+        }
 
-            if (config.UAF)
+        void ScheduleLegendOutputWorker()
+        {
+            if (ThreadPool.QueueUserWorkItem(
+                    static state => ((AIRedirector)state!).DrainLegendOutput(),
+                    this))
             {
-                var uaf = new Process
-                {
-                    StartInfo = UmaAiProcessStartInfo.Create(config.UAF_Path)
-                };
-                uaf.OutputDataReceived += (sender, e) =>
-                {
-                    rawOutput.AppendLine(e.Data);
-                };
-                processes.Add(ScenarioType.UAF, uaf);
-                Trace.WriteLine($"UAF Path: {config.UAF_Path}");
+                return;
             }
-            if (config.Cook)
+
+            lock (processOutputGate)
             {
-                var cook = new Process
-                {
-                    StartInfo = UmaAiProcessStartInfo.Create(config.Cook_Path)
-                };
-                cook.OutputDataReceived += (sender, e) =>
-                {
-                    rawOutput.AppendLine(e.Data);
-                };
-                processes.Add(ScenarioType.Cook, cook);
-                Trace.WriteLine($"Cook Path: {config.Cook_Path}");
+                legendWorkerScheduled = false;
+                pendingLegendOutput.Clear();
             }
-            if (config.Mecha)
+            throw new InvalidOperationException("无法调度 AIRedirector Legend stdout FIFO worker。");
+        }
+
+        void DrainLegendOutput()
+        {
+            try
             {
-                var mecha = new Process
+                while (true)
                 {
-                    StartInfo = UmaAiProcessStartInfo.Create(config.Mecha_Path)
-                };
-                mecha.OutputDataReceived += (sender, e) =>
-                {
-                    rawOutput.AppendLine(e.Data);
-                };
-                processes.Add(ScenarioType.Mecha, mecha);
-                Trace.WriteLine($"Mecha Path: {config.Mecha_Path}");
-            }
-            if (config.Legend)
-            {
-                var legend = new Process
-                {
-                    StartInfo = UmaAiProcessStartInfo.Create(config.Legend_Path)
-                };
-                legend.OutputDataReceived += (sender, e) =>
-                {
-                    rawOutput.AppendLine(e.Data);
-                    if (gameStarted && !string.IsNullOrEmpty(e.Data))
+                    (long Generation, string Line) item;
+                    lock (processOutputGate)
                     {
-                        if (legendOutput.ProcessLine(e.Data))
-                            legendOutput.ApplyCurrentDisplay();
-                    }
-                };
-                processes.Add(ScenarioType.Legend, legend);
-                Trace.WriteLine($"Legend Path: {config.Legend_Path}");
-            }
+                        if (!acceptingProcessOutput)
+                        {
+                            pendingLegendOutput.Clear();
+                            return;
+                        }
 
-            _childProcessManager = new ChildProcessManager();
-            foreach (var (_, process) in processes)
-            {
-                process.Start();
-                _childProcessManager.AddProcess(process);
-                process.BeginOutputReadLine();
+                        if (!pendingLegendOutput.TryDequeue(out item))
+                            return;
+                        if (item.Generation != outputGeneration)
+                            continue;
+                    }
+
+                    if (legendOutput.ProcessLine(item.Line) &&
+                        IsOutputGenerationActive(item.Generation))
+                    {
+                        global::LegendScenarioAnalyzer.LegendScenarioAnalyzer.WithCurrentDisplayCommit(
+                            () => TryBeginOutputPublish(item.Generation),
+                            EndOutputPublish,
+                            legendOutput.ApplyCurrentDisplay);
+                    }
+                }
             }
+            finally
+            {
+                var scheduleWorker = false;
+                lock (processOutputGate)
+                {
+                    legendWorkerScheduled = false;
+                    if (!acceptingProcessOutput)
+                    {
+                        pendingLegendOutput.Clear();
+                    }
+                    else if (pendingLegendOutput.Count != 0)
+                    {
+                        legendWorkerScheduled = true;
+                        scheduleWorker = true;
+                    }
+                }
+
+                if (scheduleWorker)
+                    ScheduleLegendOutputWorker();
+            }
+        }
+
+        bool IsOutputGenerationActive(long callbackGeneration)
+        {
+            lock (processOutputGate)
+                return acceptingProcessOutput && outputGeneration == callbackGeneration;
         }
 
         static void ValidateConfiguredPath(string name, bool enabled, string path)
@@ -129,6 +285,34 @@ namespace AIRedirector
 
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
                 throw new FileNotFoundException($"{name} AI 已启用，但配置的程序路径不存在: {path}", path);
+        }
+
+        bool TryBeginOutputPublish(long callbackGeneration)
+        {
+            lock (processOutputGate)
+            {
+                if (!acceptingProcessOutput || outputGeneration != callbackGeneration)
+                    return false;
+
+                if (publishingOutput++ == 0)
+                    outputPublishingDrained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                return true;
+            }
+        }
+
+        void EndOutputPublish()
+        {
+            TaskCompletionSource<object?>? drained = null;
+            lock (processOutputGate)
+            {
+                if (--publishingOutput == 0)
+                {
+                    drained = outputPublishingDrained;
+                    outputPublishingDrained = null;
+                }
+            }
+
+            drained?.TrySetResult(null);
         }
 
         public async Task ConfigPromptAsync(
@@ -349,20 +533,115 @@ namespace AIRedirector
 
         public void Dispose()
         {
-            startedSubscription?.Dispose();
-            startedSubscription = null;
-            rawOutput.Dispose();
-            foreach (var (_, process) in processes)
+            Task<Exception?>? existingCleanup = null;
+            TaskCompletionSource<Exception?>? ownedCleanup = null;
+            Task? publishWait = null;
+            Process[] started = [];
+            Process[] created = [];
+            IDisposable? subscription = null;
+            ChildProcessManager? manager = null;
+            lock (processOutputGate)
             {
-                if (!process.HasExited)
+                if (cleanupInProgress is { } currentCleanup)
                 {
-                    process.Kill();
+                    existingCleanup = currentCleanup.Task;
                 }
-                process.Dispose();
+                else
+                {
+                    acceptingProcessOutput = false;
+                    outputGeneration++;
+                    pendingLegendOutput.Clear();
+                    ownedCleanup = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    cleanupInProgress = ownedCleanup;
+
+                    started = [.. startedProcesses];
+                    startedProcesses.Clear();
+                    created = [.. createdProcesses];
+                    createdProcesses.Clear();
+                    subscription = startedSubscription;
+                    startedSubscription = null;
+                    manager = _childProcessManager;
+                    _childProcessManager = null;
+                    publishWait = outputPublishingDrained?.Task;
+                }
             }
-            processes.Clear();
-            _childProcessManager?.Dispose();
-            _childProcessManager = null;
+
+            if (existingCleanup is not null)
+            {
+                var priorFailure = existingCleanup.GetAwaiter().GetResult();
+                if (priorFailure is not null)
+                    throw priorFailure;
+                return;
+            }
+
+            publishWait?.GetAwaiter().GetResult();
+            var errors = new List<Exception>();
+            bool Capture(Action action)
+            {
+                try
+                {
+                    action();
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                    return false;
+                }
+            }
+
+            var managerDisposed = manager is null;
+            try
+            {
+                if (subscription is not null)
+                    Capture(subscription.Dispose);
+
+                foreach (var process in started)
+                    Capture(() =>
+                    {
+                        if (!process.HasExited)
+                            process.Kill();
+                    });
+
+                if (manager is not null)
+                    managerDisposed = Capture(manager.Dispose);
+
+                foreach (var process in started)
+                    Capture(() =>
+                    {
+                        if (!process.WaitForExit(ProcessExitWaitMilliseconds))
+                        {
+                            throw new TimeoutException(
+                                $"UmaAI 子进程 '{process.StartInfo.FileName}' 在终止请求后 " +
+                                $"{ProcessExitWaitMilliseconds} ms 内未退出；未执行无界 WaitForExit，" +
+                                "stdout handler 可能尚未排空。");
+                        }
+
+                        process.WaitForExit();
+                    });
+            }
+            finally
+            {
+                foreach (var process in created)
+                    Capture(process.Dispose);
+                if (!managerDisposed && manager is not null)
+                    Capture(manager.Dispose);
+                Capture(rawOutput.Dispose);
+            }
+
+            Exception? failure = errors.Count == 0
+                ? null
+                : new AggregateException("AIRedirector 清理失败。", errors);
+            ownedCleanup!.TrySetResult(failure);
+
+            lock (processOutputGate)
+            {
+                if (ReferenceEquals(cleanupInProgress, ownedCleanup))
+                    cleanupInProgress = null;
+            }
+
+            if (failure is not null)
+                throw failure;
         }
     }
 }
