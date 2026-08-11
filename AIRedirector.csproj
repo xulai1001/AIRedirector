@@ -7,6 +7,7 @@
     <Nullable>enable</Nullable>
     <Version>1.1.0</Version>
 
+    <PluginInternalName>AIRedirector</PluginInternalName>
     <PluginDisplayName>转发AI的输出到URA里</PluginDisplayName>
     <PluginAuthor>离披</PluginAuthor>
     <PluginDescription>转发AI的输出到URA里，需要修改版的简化过输出的AI</PluginDescription>

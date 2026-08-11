@@ -102,7 +102,7 @@ internal sealed class LegendAiOutputBuffer
         return false;
     }
 
-    public bool ApplyCurrentDisplay()
+    public bool ApplyCurrentDisplay(CancellationToken cancellationToken)
         => LegendTrainingDisplay.ModifyCurrent((context, display) =>
         {
             if (context.ResponseData.Stage == LegendScenarioStage.BuffSelection
@@ -117,7 +117,7 @@ internal sealed class LegendAiOutputBuffer
 
             foreach (var summary in summaries)
                 display.Extra.AddText(summary);
-        }, switchToWorkspace: false);
+        }, switchToWorkspace: false, cancellationToken);
 
     void ApplyTrainingDisplay(LegendTrainingDisplayContext context, LegendTrainingDisplayEditor display)
     {
