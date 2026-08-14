@@ -3,7 +3,7 @@ using LegendScenarioAnalyzer;
 
 namespace AIRedirector;
 
-internal sealed class LegendAiOutputBuffer
+internal sealed class LegendAiOutputBuffer : ILegendAiOutputBridge
 {
     static readonly Regex AnsiEscapePattern = new(@"\x1B\[[0-?]*[ -/]*[@-~]", RegexOptions.Compiled);
     static readonly Regex TrainingScorePattern = new(
@@ -37,6 +37,8 @@ internal sealed class LegendAiOutputBuffer
         "不选"
     };
 
+    readonly object gate = new();
+    readonly IDisposable modifierRegistration;
     readonly Dictionary<LegendTrain, string> trainingScores = [];
     readonly Dictionary<string, string> actionScores = new(StringComparer.Ordinal);
     readonly Dictionary<LegendSelectionKey, string> selectionScores = [];
@@ -44,6 +46,11 @@ internal sealed class LegendAiOutputBuffer
     string? recommendation;
     LegendTrain? recommendedTrain;
     LegendSelectionKey? recommendedSelection;
+
+    public LegendAiOutputBuffer()
+    {
+        modifierRegistration = LegendTrainingDisplay.RegisterModifier(ApplyDisplay);
+    }
 
     public bool ProcessLine(string? rawLine)
     {
@@ -54,56 +61,68 @@ internal sealed class LegendAiOutputBuffer
         if (line.Length == 0)
             return false;
 
-        if (IsTurnSeparator(line))
+        lock (gate)
         {
-            Clear();
-            return true;
+            if (IsTurnSeparator(line))
+            {
+                Clear();
+                return true;
+            }
+
+            if (TryParseTrainingScore(line, out var train, out var value))
+            {
+                trainingScores[train] = value;
+                return true;
+            }
+
+            if (TryParseSelectionScore(line, out var selectionKey, out var selectionValue))
+            {
+                selectionScores[selectionKey] = selectionValue;
+                return true;
+            }
+
+            if (IsSelectionHeading(line))
+                return true;
+
+            if (TryParseActionScore(line, out var action, out var actionValue))
+            {
+                actionScores[action] = actionValue;
+                return true;
+            }
+
+            if (TryParseRecommendation(
+                    line,
+                    out var recommendationLine,
+                    out var recommendationTrain,
+                    out var recommendationSelection))
+            {
+                recommendation = recommendationLine;
+                recommendedTrain = recommendationTrain;
+                recommendedSelection = recommendationSelection;
+                return true;
+            }
+
+            if (IsSummaryLine(line))
+            {
+                AddSummary(line);
+                return true;
+            }
+
+            return false;
         }
-
-        if (TryParseTrainingScore(line, out var train, out var value))
-        {
-            trainingScores[train] = value;
-            return true;
-        }
-
-        if (TryParseSelectionScore(line, out var selectionKey, out var selectionValue))
-        {
-            selectionScores[selectionKey] = selectionValue;
-            return true;
-        }
-
-        if (IsSelectionHeading(line))
-            return true;
-
-        if (TryParseActionScore(line, out var action, out var actionValue))
-        {
-            actionScores[action] = actionValue;
-            return true;
-        }
-
-        if (TryParseRecommendation(
-                line,
-                out var recommendationLine,
-                out var recommendationTrain,
-                out var recommendationSelection))
-        {
-            recommendation = recommendationLine;
-            recommendedTrain = recommendationTrain;
-            recommendedSelection = recommendationSelection;
-            return true;
-        }
-
-        if (IsSummaryLine(line))
-        {
-            AddSummary(line);
-            return true;
-        }
-
-        return false;
     }
 
+    public bool RefreshCurrentDisplay(CancellationToken cancellationToken)
+        => LegendTrainingDisplay.RefreshCurrent(switchToWorkspace: false, cancellationToken);
+
     public bool ApplyCurrentDisplay(CancellationToken cancellationToken)
-        => LegendTrainingDisplay.ModifyCurrent((context, display) =>
+        => RefreshCurrentDisplay(cancellationToken);
+
+    public void Dispose() => modifierRegistration.Dispose();
+
+    void ApplyDisplay(LegendTrainingDisplayContext context, LegendTrainingDisplayEditor display)
+    {
+        lock (gate)
         {
             if (context.ResponseData.Stage == LegendScenarioStage.BuffSelection
                 && context.DataSet.obtainable_buff_id_array is { Length: > 0 })
@@ -117,7 +136,8 @@ internal sealed class LegendAiOutputBuffer
 
             foreach (var summary in summaries)
                 display.Extra.AddText(summary);
-        }, switchToWorkspace: false, cancellationToken);
+        }
+    }
 
     void ApplyTrainingDisplay(LegendTrainingDisplayContext context, LegendTrainingDisplayEditor display)
     {

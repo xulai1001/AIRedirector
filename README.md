@@ -7,3 +7,5 @@
 UmaAI 子进程 stdout 按 UTF-8 读取，对应 `chcp 65001` 输出。
 
 UmaAI 子进程的工作目录设置为对应 exe 文件所在目录。
+
+manifest 中的 `LegendScenarioAnalyzer` 是软联动声明。Legend 在本轮共享插件上下文可用时，AIRedirector 注册常驻 display 修改器并在 AI 输出变化后原位刷新 Legend 面板；Legend 缺失时，配置、子进程和 AIRedirector 原始输出 workspace 仍可独立工作。

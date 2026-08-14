@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Threading.Channels;
-using LegendScenarioAnalyzer;
 using Terminal.Gui.App;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
@@ -25,7 +25,7 @@ namespace AIRedirector
             });
         ChildProcessManager? _childProcessManager;
         AIRedirectorConfig config = new();
-        readonly LegendAiOutputBuffer legendOutput = new();
+        ILegendAiOutputBridge? legendOutput;
         readonly UmaAiRawOutputWorkspace rawOutput = new();
         bool gameStarted;
 
@@ -43,6 +43,8 @@ namespace AIRedirector
                     return ValueTask.CompletedTask;
                 });
                 context.RunBackground(ConsumeProcessOutputAsync);
+                if (context.IsPluginAvailable("LegendScenarioAnalyzer"))
+                    legendOutput = CreateLegendOutputBridge();
 
                 var sendGameStatusDataDirectory = Path.Combine("PluginData", "SendGameStatusPlugin");
                 if (Directory.Exists(sendGameStatusDataDirectory))
@@ -135,11 +137,12 @@ namespace AIRedirector
                         !output.ApplyToLegend ||
                         !Volatile.Read(ref gameStarted) ||
                         string.IsNullOrEmpty(output.Line) ||
-                        !legendOutput.ProcessLine(output.Line))
+                        Volatile.Read(ref legendOutput) is not { } bridge ||
+                        !bridge.ProcessLine(output.Line))
                         continue;
 
                     cancellationToken.ThrowIfCancellationRequested();
-                    _ = legendOutput.ApplyCurrentDisplay(cancellationToken);
+                    _ = bridge.RefreshCurrentDisplay(cancellationToken);
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -161,6 +164,9 @@ namespace AIRedirector
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
                 throw new FileNotFoundException($"{name} AI 已启用，但配置的程序路径不存在: {path}", path);
         }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static ILegendAiOutputBridge CreateLegendOutputBridge() => new LegendAiOutputBuffer();
 
         public async Task ConfigPromptAsync(
             IApplication application,
@@ -359,6 +365,7 @@ namespace AIRedirector
         public void Dispose()
         {
             _ = processOutput.Writer.TryComplete();
+            var legendBridge = Interlocked.Exchange(ref legendOutput, null);
             var started = startedProcesses.ToArray();
             startedProcesses.Clear();
             var created = createdProcesses.ToArray();
@@ -413,6 +420,8 @@ namespace AIRedirector
                     Capture(process.Dispose);
                 if (!managerDisposed && manager is not null)
                     Capture(manager.Dispose);
+                if (legendBridge is not null)
+                    Capture(legendBridge.Dispose);
                 Capture(rawOutput.Dispose);
             }
 
@@ -424,5 +433,11 @@ namespace AIRedirector
         }
 
         readonly record struct ProcessOutput(string? Line, bool ApplyToLegend);
+    }
+
+    internal interface ILegendAiOutputBridge : IDisposable
+    {
+        bool ProcessLine(string? rawLine);
+        bool RefreshCurrentDisplay(CancellationToken cancellationToken);
     }
 }
