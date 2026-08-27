@@ -1,11 +1,17 @@
 # AIRedirector
 
-`AIRedirector` 启动配置的 UmaAI 子进程，并在 `AIRedirector` workspace 显示 `UmaAI.exe` stdout 原始行。
+`AIRedirector` 是 URA 的 Windows 插件，启动为 UAF、Cook、Mecha 或 Legend 配置的 `UmaAI.exe`，并在 `AIRedirector` workspace 显示子进程的 UTF-8 stdout。每个进程以其 exe 所在目录作为工作目录。
 
-配置 Dialog 使用 Host 传入的同一 `IApplication`。纵向 `Menu` 使用 `CheckBox` 开关各场景；只有启用的场景显示路径项，路径通过 Terminal.Gui `OpenDialog` FilePicker 选择。字段先写入 draft，只有选择“保存”才持久化到 `PluginData/AIRedirector/settings.json`；“取消”、Esc、关闭 Dialog 或 cancellation 均不写配置。
+## 配置
 
-UmaAI 子进程 stdout 按 UTF-8 读取，对应 `chcp 65001` 输出。
+配置界面使用 Host 提供的 Terminal.Gui `IApplication`。场景开关控制对应路径项；文件选择器只接受现有 exe。只有“保存”会将草稿写入 `PluginData/AIRedirector/settings.json`，取消或关闭界面不会写入配置。启用场景的程序路径无效时，插件初始化失败并报告路径。
 
-UmaAI 子进程的工作目录设置为对应 exe 文件所在目录。
+## Legend 联动
 
-manifest 中的 `LegendScenarioAnalyzer` 是软联动声明。Legend 在本轮共享插件上下文可用时，AIRedirector 注册 display part producer，将补充输出写入 `AI` Extra section，并在 AI 输出变化后原位刷新 Legend 面板；Legend 缺失时，配置、子进程和 AIRedirector 原始输出 workspace 仍可独立工作。
+manifest 将 `LegendScenarioAnalyzer` 声明为软联动。共享插件上下文中存在 Legend 时，AIRedirector 将训练评分与可定位的训练建议追加到训练卡，将心得候选评分与可定位建议追加到心得卡；行动评分、汇总和无法定位到卡片的普通建议写入非空时标题为 `AI` 的 Extra section，重要行动建议写入 Important。解析到可展示输出后会刷新对应训练记录。缺少 Legend 时，配置、子进程和原始输出 workspace 可独立运行。
+
+## 构建
+
+```powershell
+dotnet build .\AIRedirector.csproj -c Release -p:GenerateUraPluginManifestOnBuild=false -p:PackageUraPluginOnBuild=false -p:DeployUraPluginToLocalAppDataOnBuild=false -p:UraHostProjectPath=<ura-host-project>
+```
