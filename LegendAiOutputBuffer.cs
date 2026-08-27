@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using System.Text.RegularExpressions;
 using LegendScenarioAnalyzer;
 
@@ -38,7 +39,7 @@ internal sealed class LegendAiOutputBuffer : ILegendAiOutputBridge
     };
 
     readonly object gate = new();
-    readonly IDisposable modifierRegistration;
+    readonly LegendTrainingDisplayPartProducer producer;
     readonly Dictionary<LegendTrain, string> trainingScores = [];
     readonly Dictionary<string, string> actionScores = new(StringComparer.Ordinal);
     readonly Dictionary<LegendSelectionKey, string> selectionScores = [];
@@ -46,10 +47,11 @@ internal sealed class LegendAiOutputBuffer : ILegendAiOutputBridge
     string? recommendation;
     LegendTrain? recommendedTrain;
     LegendSelectionKey? recommendedSelection;
+    LegendTrainingDisplayId? targetId;
 
     public LegendAiOutputBuffer()
     {
-        modifierRegistration = LegendTrainingDisplay.RegisterModifier(ApplyDisplay);
+        producer = LegendTrainingDisplay.RegisterPartProducer("AI");
     }
 
     public bool ProcessLine(string? rawLine)
@@ -112,37 +114,72 @@ internal sealed class LegendAiOutputBuffer : ILegendAiOutputBridge
         }
     }
 
-    public bool RefreshCurrentDisplay(CancellationToken cancellationToken)
-        => LegendTrainingDisplay.RefreshCurrent(switchToWorkspace: false, cancellationToken);
-
-    public bool ApplyCurrentDisplay(CancellationToken cancellationToken)
-        => RefreshCurrentDisplay(cancellationToken);
-
-    public void Dispose() => modifierRegistration.Dispose();
-
-    void ApplyDisplay(LegendTrainingDisplayContext context, LegendTrainingDisplayEditor display)
+    public void SetTarget(int singleModeCharaId, int turn)
     {
+        var next = new LegendTrainingDisplayId(singleModeCharaId, turn);
         lock (gate)
         {
-            if (context.ResponseData.Stage == LegendScenarioStage.BuffSelection
-                && context.DataSet.obtainable_buff_id_array is { Length: > 0 })
-            {
-                ApplyBuffSelectionDisplay(display);
-            }
-            else
-            {
-                ApplyTrainingDisplay(context, display);
-            }
-
-            foreach (var summary in summaries)
-                display.Extra.AddText(summary);
+            if (targetId == next)
+                return;
+            targetId = next;
+            Clear();
         }
     }
 
-    void ApplyTrainingDisplay(LegendTrainingDisplayContext context, LegendTrainingDisplayEditor display)
+    public bool ApplyTargetDisplay(CancellationToken cancellationToken)
+    {
+        LegendTrainingDisplayId id;
+        LegendAiDisplayPart part;
+        lock (gate)
+        {
+            if (targetId is not { } target)
+                return false;
+            id = target;
+            part = new(
+                trainingScores.ToFrozenDictionary(),
+                actionScores.ToFrozenDictionary(StringComparer.Ordinal),
+                selectionScores.ToFrozenDictionary(),
+                [.. summaries],
+                recommendation,
+                recommendedTrain,
+                recommendedSelection);
+        }
+
+        producer.Update(id, (context, display) => ApplyDisplay(part, context, display));
+        return LegendTrainingDisplay.Show(
+            id,
+            switchToWorkspace: false,
+            cancellationToken);
+    }
+
+    public void Dispose() => producer.Dispose();
+
+    static void ApplyDisplay(
+        LegendAiDisplayPart part,
+        LegendTrainingDisplayContext context,
+        LegendTrainingDisplayEditor display)
+    {
+        if (context.ResponseData.Stage == LegendScenarioStage.BuffSelection
+            && context.DataSet.obtainable_buff_id_array is { Length: > 0 })
+        {
+            ApplyBuffSelectionDisplay(part, display);
+        }
+        else
+        {
+            ApplyTrainingDisplay(part, context, display);
+        }
+
+        foreach (var summary in part.Summaries)
+            display.Extra.AddText(summary);
+    }
+
+    static void ApplyTrainingDisplay(
+        LegendAiDisplayPart part,
+        LegendTrainingDisplayContext context,
+        LegendTrainingDisplayEditor display)
     {
         var isTraining = context.ResponseData.Stage == LegendScenarioStage.Training;
-        foreach (var (train, score) in trainingScores.OrderBy(x => (int)x.Key))
+        foreach (var (train, score) in part.TrainingScores.OrderBy(x => (int)x.Key))
         {
             if (isTraining)
             {
@@ -156,13 +193,13 @@ internal sealed class LegendAiOutputBuffer : ILegendAiOutputBridge
 
         foreach (var action in new[] { "休息", "外出" })
         {
-            if (actionScores.TryGetValue(action, out var score))
+            if (part.ActionScores.TryGetValue(action, out var score))
                 display.Extra.AddText($"{action}: {score}");
         }
 
-        if (recommendation is { } recommendationLine)
+        if (part.Recommendation is { } recommendationLine)
         {
-            if (isTraining && recommendedTrain is { } train)
+            if (isTraining && part.RecommendedTrain is { } train)
             {
                 display.Training.Modify(train, card =>
                 {
@@ -177,16 +214,16 @@ internal sealed class LegendAiOutputBuffer : ILegendAiOutputBridge
         }
     }
 
-    void ApplyBuffSelectionDisplay(LegendTrainingDisplayEditor display)
+    static void ApplyBuffSelectionDisplay(LegendAiDisplayPart part, LegendTrainingDisplayEditor display)
     {
-        foreach (var (selection, score) in selectionScores.OrderBy(x => x.Key.Color).ThenBy(x => x.Key.OrdinalWithinColor))
+        foreach (var (selection, score) in part.SelectionScores.OrderBy(x => x.Key.Color).ThenBy(x => x.Key.OrdinalWithinColor))
         {
             TryModifySelection(display, selection, card => card.AddText($"AI评分: {score}"));
         }
 
-        if (recommendation is { } recommendationLine)
+        if (part.Recommendation is { } recommendationLine)
         {
-            if (recommendedSelection is { } selection
+            if (part.RecommendedSelection is { } selection
                 && TryModifySelection(display, selection, card =>
                 {
                     card.Highlight();
@@ -426,6 +463,15 @@ internal sealed class LegendAiOutputBuffer : ILegendAiOutputBridge
             return false;
         }
     }
+
+    sealed record LegendAiDisplayPart(
+        FrozenDictionary<LegendTrain, string> TrainingScores,
+        FrozenDictionary<string, string> ActionScores,
+        FrozenDictionary<LegendSelectionKey, string> SelectionScores,
+        string[] Summaries,
+        string? Recommendation,
+        LegendTrain? RecommendedTrain,
+        LegendSelectionKey? RecommendedSelection);
 
     readonly record struct LegendSelectionKey(LegendBuffColor Color, int OrdinalWithinColor);
 }

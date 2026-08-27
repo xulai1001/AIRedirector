@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
+using Gallop;
 using Terminal.Gui.App;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
@@ -44,7 +45,10 @@ namespace AIRedirector
                 });
                 context.RunBackground(ConsumeProcessOutputAsync);
                 if (context.IsPluginAvailable("LegendScenarioAnalyzer"))
+                {
                     legendOutput = CreateLegendOutputBridge();
+                    RegisterLegendDisplayIdAnalyzers(context);
+                }
 
                 var sendGameStatusDataDirectory = Path.Combine("PluginData", "SendGameStatusPlugin");
                 if (Directory.Exists(sendGameStatusDataDirectory))
@@ -142,7 +146,7 @@ namespace AIRedirector
                         continue;
 
                     cancellationToken.ThrowIfCancellationRequested();
-                    _ = bridge.RefreshCurrentDisplay(cancellationToken);
+                    _ = bridge.ApplyTargetDisplay(cancellationToken);
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -167,6 +171,35 @@ namespace AIRedirector
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         static ILegendAiOutputBridge CreateLegendOutputBridge() => new LegendAiOutputBuffer();
+
+        void RegisterLegendDisplayIdAnalyzers(IPluginContext context)
+        {
+            context.Analyzers.Register<SingleModeLegendCheckEventResponse>(
+                AnalyzerKind.Response,
+                [
+                    EndpointPattern.Regex(
+                        "/umamusume/single_mode_legend/(?:change_short_cut|check_event|cm_end|continue|exec_command|finish_claw_crane|gain_skills|legend_race_(?:continue|end|entry|out|start)|popularity_end|race_(?:end|entry|out))")
+                ],
+                invocation => SetLegendDisplayId(invocation.Payload.data?.chara_info),
+                priority: 0);
+            context.Analyzers.Register<SingleModeLegendLoadResponse>(
+                AnalyzerKind.Response,
+                [EndpointPattern.Exact("/umamusume/single_mode_legend/load")],
+                invocation => SetLegendDisplayId(
+                    invocation.Payload.data?.single_mode_load_common?.chara_info),
+                priority: 0);
+        }
+
+        ValueTask SetLegendDisplayId(SingleModeChara? chara)
+        {
+            if (chara is not null)
+            {
+                Volatile.Read(ref legendOutput)?.SetTarget(
+                    chara.single_mode_chara_id,
+                    chara.turn);
+            }
+            return ValueTask.CompletedTask;
+        }
 
         public async Task ConfigPromptAsync(
             IApplication application,
@@ -438,6 +471,7 @@ namespace AIRedirector
     internal interface ILegendAiOutputBridge : IDisposable
     {
         bool ProcessLine(string? rawLine);
-        bool RefreshCurrentDisplay(CancellationToken cancellationToken);
+        void SetTarget(int singleModeCharaId, int turn);
+        bool ApplyTargetDisplay(CancellationToken cancellationToken);
     }
 }
