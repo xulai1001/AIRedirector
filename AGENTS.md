@@ -2,24 +2,25 @@
 
 ## 仓库与结构
 
-- 本目录是独立 Git 根。父目录提供共享 build targets 和 smoke 项目；`LegendScenarioAnalyzer` 是独立 sibling 仓库，未经明确授权不得修改。
+- 本目录是独立 Git 根；`deps/UmamusumeResponseAnalyzer` 与 `deps/LegendScenarioAnalyzer` 固定构建和联动源码，行为 smoke 位于 `tests/AIRedirectorSmoke`。
 - `Class1.cs` 负责生命周期、配置界面、进程输出路由和 Legend 联动。
 - `AIRedirectorConfig.cs` 负责 `PluginData/AIRedirector/settings.json`；`UmaAiProcessStartInfo.cs` 与 `ChildProcessManager.cs` 负责 Windows 子进程。
 - `UmaAiRawOutputWorkspace.cs` 负责原始输出，`LegendAiOutputBuffer.cs` 负责解析并修改 Legend display。
 
 ## 构建与测试
 
-构建时关闭 manifest、打包和本机部署副作用，并显式传入 Host 项目：
+克隆后初始化源码依赖；Release 构建生成插件包但不部署到本机：
 
 ```powershell
-dotnet build .\AIRedirector.csproj -c Release -p:GenerateUraPluginManifestOnBuild=false -p:PackageUraPluginOnBuild=false -p:DeployUraPluginToLocalAppDataOnBuild=false -p:UraHostProjectPath=<ura-host-project>
+git -c core.longpaths=true submodule update --init --recursive
+dotnet build .\AIRedirector.csproj -c Release -m:1 -p:RuntimeIdentifier=win-x64 -p:SelfContained=false -p:PlatformTarget=AnyCPU -p:DeployUraPluginToLocalAppDataOnBuild=false
 ```
 
-行为改动使用父目录中的现有 smoke 入口：
+行为改动运行仓内 smoke；它同时引用 AIR 与 Legend，必须通过全局 MSBuild 属性统一到仓内 Host：
 
 ```powershell
-dotnet run --project ..\tests\AIRedirectorSmoke\AIRedirectorSmoke.csproj -c Release -p:GenerateUraPluginManifestOnBuild=false -p:PackageUraPluginOnBuild=false -p:DeployUraPluginToLocalAppDataOnBuild=false -p:UraHostProjectPath=<ura-host-project>
-dotnet run --project ..\tests\PluginRuntimeSmoke\PluginRuntimeSmoke.csproj -c Release -p:GenerateUraPluginManifestOnBuild=false -p:PackageUraPluginOnBuild=false -p:DeployUraPluginToLocalAppDataOnBuild=false -p:UraHostProjectPath=<ura-host-project> -- AIRedirector
+$uraHostProject = (Resolve-Path .\deps\UmamusumeResponseAnalyzer\UmamusumeResponseAnalyzer\UmamusumeResponseAnalyzer.csproj).Path
+dotnet run --project .\tests\AIRedirectorSmoke\AIRedirectorSmoke.csproj -c Release -p:UraHostProjectPath="$uraHostProject" -p:GenerateUraPluginManifestOnBuild=false -p:PackageUraPluginOnBuild=false -p:DeployUraPluginToLocalAppDataOnBuild=false
 ```
 
 ## 代码与安全边界

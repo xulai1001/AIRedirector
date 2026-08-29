@@ -25,7 +25,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\LegendScenarioAnalyzer\LegendScenarioAnalyzer.csproj" Private="false" />
+    <ProjectReference Include="deps\LegendScenarioAnalyzer\LegendScenarioAnalyzer.csproj"
+                      AdditionalProperties="UraHostProjectPath=$(UraHostProjectPath)"
+                      Private="false" />
   </ItemGroup>
 
 </Project>

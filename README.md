@@ -12,6 +12,11 @@ manifest 将 `LegendScenarioAnalyzer` 声明为软联动。共享插件上下文
 
 ## 构建
 
+仓库通过 Git submodule 固定 Host 与 Legend 源码。克隆后在仓库根执行：
+
 ```powershell
-dotnet build .\AIRedirector.csproj -c Release -p:GenerateUraPluginManifestOnBuild=false -p:PackageUraPluginOnBuild=false -p:DeployUraPluginToLocalAppDataOnBuild=false -p:UraHostProjectPath=<ura-host-project>
+git -c core.longpaths=true submodule update --init --recursive
+dotnet build .\AIRedirector.csproj -c Release -m:1 -p:RuntimeIdentifier=win-x64 -p:SelfContained=false -p:PlatformTarget=AnyCPU -p:DeployUraPluginToLocalAppDataOnBuild=false
+$uraHostProject = (Resolve-Path .\deps\UmamusumeResponseAnalyzer\UmamusumeResponseAnalyzer\UmamusumeResponseAnalyzer.csproj).Path
+dotnet run --project .\tests\AIRedirectorSmoke\AIRedirectorSmoke.csproj -c Release -p:UraHostProjectPath="$uraHostProject" -p:GenerateUraPluginManifestOnBuild=false -p:PackageUraPluginOnBuild=false -p:DeployUraPluginToLocalAppDataOnBuild=false
 ```
