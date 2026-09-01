@@ -26,8 +26,11 @@
 
   <ItemGroup>
     <ProjectReference Include="deps\LegendScenarioAnalyzer\LegendScenarioAnalyzer.csproj"
-                      AdditionalProperties="UraHostProjectPath=$(UraHostProjectPath)"
                       Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="UmamusumeResponseAnalyzer" Version="2026.9.1" />
   </ItemGroup>
 
 </Project>
