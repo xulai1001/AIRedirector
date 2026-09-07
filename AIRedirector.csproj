@@ -17,17 +17,15 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="LegendAiOutputBuffer.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="AIRedirectorSmoke" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Terminal.Gui" Version="2.4.17" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="deps\LegendScenarioAnalyzer\LegendScenarioAnalyzer.csproj"
-                      AdditionalProperties="UraHostProjectPath=$(UraHostProjectPath)"
-                      Private="false" />
   </ItemGroup>
 
 </Project>

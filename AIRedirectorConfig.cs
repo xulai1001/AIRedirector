@@ -17,6 +17,9 @@ internal sealed class AIRedirectorConfig
     public string Mecha_Path { get; set; } = string.Empty;
     public bool Legend { get; set; }
     public string Legend_Path { get; set; } = string.Empty;
+    /// 拉面剧本（scenarioId=14，详见集成文档 §3.4 / §4.2）
+    public bool Ramen { get; set; }
+    public string Ramen_Path { get; set; } = string.Empty;
 
     public static AIRedirectorConfig Load(string path)
     {

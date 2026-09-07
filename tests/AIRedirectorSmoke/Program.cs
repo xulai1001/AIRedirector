@@ -30,6 +30,10 @@ TestRawUmaAiOutputWorkspaceRendersFullBufferAndDisposesPanel(ui);
 await TestLegendTrainingOutputPatchesCurrentWorkspaceAndClearsStaleOutput(ui);
 await TestLegendNonTrainingRecommendationsRenderInImportant(ui);
 await TestLegendBuffSelectionOutputUsesObtainableBuffContext(ui);
+TestTryParseUmaAiDecisionAcceptsRamenJsonLine();
+TestTryParseUmaAiDecisionAcceptsOnsenJsonLine();
+TestTryParseUmaAiDecisionRejectsNonJsonLine();
+TestTryParseUmaAiDecisionRejectsJsonWithoutSchemaVersion();
 
 Console.WriteLine("PASS AIRedirector smoke");
 
@@ -1025,4 +1029,49 @@ sealed class TerminalGuiSmokeApp : IDisposable
             }
         }
     }
+}
+
+// ===========================================================================
+// UmaAI --json 决策解析（Step 8）
+// ===========================================================================
+
+/// 解析合法的拉面剧本决策 JSON：scenario="ramen"，完整字段透传
+static void TestTryParseUmaAiDecisionAcceptsRamenJsonLine()
+{
+    const string line = """{"schema_version":1,"turn":42,"scenario":"ramen","action_index":3,"score":56712.3,"candidate_scores":[56712.3,56100.5,55234.1],"candidate_n":[1024,800,256],"reason":"vs #2 智+180 PT-33"}""";
+    if (!AIRedirector.AIRedirector.TryParseUmaAiDecision(line, out var decision))
+        throw new InvalidOperationException("拉面 JSON 行应解析成功");
+    if (decision.ActionIndex != 3) throw new InvalidOperationException($"action_index={decision.ActionIndex}");
+    if (decision.Score is not (> 56712.0 and < 56712.5)) throw new InvalidOperationException($"score={decision.Score}");
+    if (decision.Scenario != "ramen") throw new InvalidOperationException($"scenario={decision.Scenario}");
+    if (decision.Turn != 42) throw new InvalidOperationException($"turn={decision.Turn}");
+    if (decision.Reason != "vs #2 智+180 PT-33") throw new InvalidOperationException($"reason={decision.Reason}");
+}
+
+/// 解析温泉剧本决策 JSON：scenario="onsen"，reason 可空
+static void TestTryParseUmaAiDecisionAcceptsOnsenJsonLine()
+{
+    const string line = """{"schema_version":1,"turn":12,"scenario":"onsen","action_index":0,"score":54321.0}""";
+    if (!AIRedirector.AIRedirector.TryParseUmaAiDecision(line, out var decision))
+        throw new InvalidOperationException("温泉 JSON 行应解析成功");
+    if (decision.ActionIndex != 0) throw new InvalidOperationException($"action_index={decision.ActionIndex}");
+    if (decision.Scenario != "onsen") throw new InvalidOperationException($"scenario={decision.Scenario}");
+    if (decision.Turn != 12) throw new InvalidOperationException($"turn={decision.Turn}");
+    if (decision.Reason is not null) throw new InvalidOperationException($"reason 应为 null，得到 {decision.Reason}");
+}
+
+/// 玩家模式 stdout 行（非 JSON）应被拒绝，不抛异常
+static void TestTryParseUmaAiDecisionRejectsNonJsonLine()
+{
+    const string line = "AI 选择: 第 2 个动作（评分: 1234）";
+    if (AIRedirector.AIRedirector.TryParseUmaAiDecision(line, out _))
+        throw new InvalidOperationException("非 JSON 行应被拒绝");
+}
+
+/// 旧版 stdout JSON（无 schema_version）应被拒绝
+static void TestTryParseUmaAiDecisionRejectsJsonWithoutSchemaVersion()
+{
+    const string line = """{"turn":5,"scenario":"onsen","action_index":1,"score":1000.0}""";
+    if (AIRedirector.AIRedirector.TryParseUmaAiDecision(line, out _))
+        throw new InvalidOperationException("缺 schema_version 的 JSON 应被拒绝");
 }

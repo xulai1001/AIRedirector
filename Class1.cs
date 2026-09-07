@@ -1,6 +1,7 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using System.Threading.Channels;
 using Gallop;
 using Terminal.Gui.App;
@@ -44,12 +45,13 @@ namespace AIRedirector
                     return ValueTask.CompletedTask;
                 });
                 context.RunBackground(ConsumeProcessOutputAsync);
+                /*
                 if (context.IsPluginAvailable("LegendScenarioAnalyzer"))
                 {
                     legendOutput = CreateLegendOutputBridge();
                     RegisterLegendDisplayIdAnalyzers(context);
                 }
-
+                */
                 var sendGameStatusDataDirectory = Path.Combine("PluginData", "SendGameStatusPlugin");
                 if (Directory.Exists(sendGameStatusDataDirectory))
                 {
@@ -66,6 +68,7 @@ namespace AIRedirector
                 ValidateConfiguredPath("Cook", config.Cook, config.Cook_Path);
                 ValidateConfiguredPath("Mecha", config.Mecha, config.Mecha_Path);
                 ValidateConfiguredPath("Legend", config.Legend, config.Legend_Path);
+                ValidateConfiguredPath("Ramen", config.Ramen, config.Ramen_Path);
 
                 if (config.UAF)
                     Trace.WriteLine($"UAF Path: {config.UAF_Path}");
@@ -75,6 +78,8 @@ namespace AIRedirector
                     Trace.WriteLine($"Mecha Path: {config.Mecha_Path}");
                 if (config.Legend)
                     Trace.WriteLine($"Legend Path: {config.Legend_Path}");
+                if (config.Ramen)
+                    Trace.WriteLine($"Ramen Path: {config.Ramen_Path}");
 
                 var manager = new ChildProcessManager();
                 _childProcessManager = manager;
@@ -87,6 +92,8 @@ namespace AIRedirector
                     StartProcess(manager, "Mecha", config.Mecha_Path);
                 if (config.Legend)
                     StartProcess(manager, "Legend", config.Legend_Path, applyToLegend: true);
+                if (config.Ramen)
+                    StartProcess(manager, "Ramen", config.Ramen_Path, jsonMode: true);
             }
             catch (Exception initializationException)
             {
@@ -110,13 +117,14 @@ namespace AIRedirector
             ChildProcessManager manager,
             string name,
             string path,
-            bool applyToLegend = false)
+            bool applyToLegend = false,
+            bool jsonMode = false)
         {
             var process = new Process
             {
-                StartInfo = UmaAiProcessStartInfo.Create(path)
+                StartInfo = UmaAiProcessStartInfo.Create(path, jsonMode: jsonMode)
             };
-            process.OutputDataReceived += (_, e) => HandleOutput(e.Data, applyToLegend);
+            process.OutputDataReceived += (_, e) => HandleOutput(e.Data, applyToLegend, jsonMode);
             createdProcesses.Add(process);
 
             if (!process.Start())
@@ -128,8 +136,65 @@ namespace AIRedirector
             process.BeginOutputReadLine();
         }
 
-        void HandleOutput(string? line, bool applyToLegend = false)
-            => processOutput.Writer.TryWrite(new(line, applyToLegend));
+        void HandleOutput(string? line, bool applyToLegend, bool jsonMode = false)
+        {
+            if (line is null)
+                return;
+
+            if (jsonMode && TryParseUmaAiDecision(line, out var decision))
+            {
+                // JSON 决策模式：解析成功 → 路由到对应剧本渲染
+                ApplyDecision(decision);
+                // 原始 stdout 仍写到 raw output（用户能看到 JSON 决策原始流）
+            }
+
+            // 非 JSON 行 / JSON 解析失败 / 兜底：原样写入 raw output channel
+            processOutput.Writer.TryWrite(new(line, applyToLegend));
+        }
+
+        /// 尝试解析 UmaAI `--json` 模式输出的一行决策 JSON
+        ///
+        /// 详见集成文档 §3.2.6 / §4.3：以 `schema_version` 字段作为协议标记。
+        /// 解析失败（缺字段 / 非 JSON / 旧版 stdout）一律返回 `false`，不抛异常。
+        internal static bool TryParseUmaAiDecision(string line, out UmaAiDecision decision)
+        {
+            decision = default;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("schema_version", out _))
+                    return false;
+
+                var actionIndex = root.TryGetProperty("action_index", out var ai) ? ai.GetInt32() : -1;
+                var score = root.TryGetProperty("score", out var s) ? s.GetDouble() : 0.0;
+                var scenario = root.TryGetProperty("scenario", out var sc) ? sc.GetString() ?? "" : "";
+                var turn = root.TryGetProperty("turn", out var t) ? t.GetUInt32() : 0u;
+                string? reason = root.TryGetProperty("reason", out var r) && r.ValueKind != JsonValueKind.Null
+                    ? r.GetString()
+                    : null;
+
+                decision = new UmaAiDecision(actionIndex, score, scenario, turn, reason);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// 路由到对应剧本的 UI 渲染
+        ///
+        /// **Step 8 占位**：当前仅在诊断输出记录决策——实际 UI 渲染（黑板 / 小黑板）待
+        /// 后续步骤按 `scenario` 路由到具体实现。原始 stdout 已写到 raw output workspace
+        /// （用户始终能看到 AI 决策原始 JSON 流），不影响此处渲染职责。
+        void ApplyDecision(UmaAiDecision decision)
+        {
+            Trace.WriteLine(
+                $"UmaAi 决策 [scenario={decision.Scenario} turn={decision.Turn} " +
+                $"action={decision.ActionIndex} score={decision.Score:F0}]" +
+                (decision.Reason is { } r ? $" reason={r}" : ""));
+        }
 
         async ValueTask ConsumeProcessOutputAsync(CancellationToken cancellationToken)
         {
@@ -168,10 +233,10 @@ namespace AIRedirector
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
                 throw new FileNotFoundException($"{name} AI 已启用，但配置的程序路径不存在: {path}", path);
         }
-
+        /*
         [MethodImpl(MethodImplOptions.NoInlining)]
         static ILegendAiOutputBridge CreateLegendOutputBridge() => new LegendAiOutputBuffer();
-
+        */
         void RegisterLegendDisplayIdAnalyzers(IPluginContext context)
         {
             context.Analyzers.Register<SingleModeLegendCheckEventResponse>(
@@ -259,8 +324,9 @@ namespace AIRedirector
                 {
                     ConfigAction.EditUaf => ("UAF", draft.UAF_Path),
                     ConfigAction.EditCook => ("Cook", draft.Cook_Path),
-                    ConfigAction.EditMecha => ("Mecha", draft.Mecha_Path),
+                    ConfigAction.EditMecha => ("Mecha", config.Mecha_Path),
                     ConfigAction.EditLegend => ("Legend", draft.Legend_Path),
+                    ConfigAction.EditRamen => ("Ramen", draft.Ramen_Path),
                     _ => throw new UnreachableException(),
                 };
                 var edited = RunFilePicker(
@@ -284,6 +350,9 @@ namespace AIRedirector
                         break;
                     case ConfigAction.EditLegend:
                         draft.Legend_Path = edited;
+                        break;
+                    case ConfigAction.EditRamen:
+                        draft.Ramen_Path = edited;
                         break;
                 }
             }
@@ -341,6 +410,7 @@ namespace AIRedirector
             AddScenario("Cook", draft.Cook, draft.Cook_Path, value => draft.Cook = value, ConfigAction.EditCook);
             AddScenario("Mecha", draft.Mecha, draft.Mecha_Path, value => draft.Mecha = value, ConfigAction.EditMecha);
             AddScenario("Legend", draft.Legend, draft.Legend_Path, value => draft.Legend = value, ConfigAction.EditLegend);
+            AddScenario("Ramen", draft.Ramen, draft.Ramen_Path, value => draft.Ramen = value, ConfigAction.EditRamen);
             items.Add(new MenuItem("保存", action: () =>
             {
                 action = ConfigAction.Save;
@@ -393,6 +463,7 @@ namespace AIRedirector
             EditCook,
             EditMecha,
             EditLegend,
+            EditRamen,
         }
 
         public void Dispose()
@@ -474,4 +545,19 @@ namespace AIRedirector
         void SetTarget(int singleModeCharaId, int turn);
         bool ApplyTargetDisplay(CancellationToken cancellationToken);
     }
+
+    /// AIRedirector 解析后的 UmaAI 决策（详见集成文档 §3.2.6 / §4.3）
+    ///
+    /// 与 Rust 端 `StdoutJsonSink` 输出 schema 对齐：
+    /// - `schema_version`（int）已识别
+    /// - `action_index`（int）/ `score`（f64）/ `scenario`（str）/ `turn`（u32）
+    ///   / `reason`（str?）按 JSON 字段填充
+    /// - `candidate_n` / `candidate_scores` / `scenario_extra` 暂不解析
+    ///   （Step 8 路由需求外，原始 stdout 已写到 raw output）
+    internal readonly record struct UmaAiDecision(
+        int ActionIndex,
+        double Score,
+        string Scenario,
+        uint Turn,
+        string? Reason);
 }
