@@ -2,7 +2,7 @@
 
 ## 仓库与结构
 
-- 本目录是独立 Git 根；Host API 与构建契约来自 `UmamusumeResponseAnalyzer` NuGet 包，`deps/LegendScenarioAnalyzer` 固定联动源码。Host-dependent smoke 位于 `URA-Plugins.Integration/tests/AIRedirectorSmoke`。
+- 本目录是独立 Git 根；Host API 与构建契约来自 `UmamusumeResponseAnalyzer` NuGet 包，`deps/LegendScenarioAnalyzer` 固定联动源码。Host-dependent smoke 位于 `tests/AIRedirectorSmoke`。
 - `Class1.cs` 负责生命周期、配置界面、进程输出路由和 Legend 联动。
 - `AIRedirectorConfig.cs` 负责 `PluginData/AIRedirector/settings.json`；`UmaAiProcessStartInfo.cs` 与 `ChildProcessManager.cs` 负责 Windows 子进程。
 - `UmaAiRawOutputWorkspace.cs` 负责原始输出，`LegendAiOutputBuffer.cs` 负责解析并修改 Legend display。
@@ -16,7 +16,7 @@ git -c core.longpaths=true submodule update --init --recursive
 dotnet build .\AIRedirector.csproj -c Release -m:1 -p:RuntimeIdentifier=win-x64 -p:SelfContained=false -p:PlatformTarget=AnyCPU -p:DeployUraPluginToLocalAppDataOnBuild=false
 ```
 
-行为改动运行 Integration 中同时引用 Host、AIR 与 Legend 的 `AIRedirectorSmoke`。
+行为改动运行 `act workflow_dispatch --artifact-server-path "$env:TEMP/ura-act-artifacts"`，其中 `tests/AIRedirectorSmoke` 同时引用实际 NuGet 包对应的 Host、AIR 与 Legend。
 
 ## 代码与安全边界
 

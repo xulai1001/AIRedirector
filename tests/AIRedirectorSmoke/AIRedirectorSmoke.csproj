@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsUraPlugin>false</IsUraPlugin>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="$(UraTestHostRoot)\eng\PluginTesting\SmokeHost.cs" Link="WorkspaceSmokeSession.cs" />
+    <ProjectReference Include="$(UraTestHostRoot)\UmamusumeResponseAnalyzer\UmamusumeResponseAnalyzer.csproj" />
+    <ProjectReference Include="..\..\AIRedirector.csproj" AdditionalProperties="GenerateUraPluginManifestOnBuild=false;PackageUraPluginOnBuild=false;DeployUraPluginToLocalAppDataOnBuild=false" />
+    <ProjectReference Include="..\..\deps\LegendScenarioAnalyzer\LegendScenarioAnalyzer.csproj" AdditionalProperties="GenerateUraPluginManifestOnBuild=false;PackageUraPluginOnBuild=false;DeployUraPluginToLocalAppDataOnBuild=false" />
+  </ItemGroup>
+
+</Project>
