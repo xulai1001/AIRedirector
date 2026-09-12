@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -141,21 +142,45 @@ namespace AIRedirector
             if (line is null)
                 return;
 
-            if (jsonMode && TryParseUmaAiDecision(line, out var decision))
+            if (jsonMode)
             {
-                // JSON 决策模式：解析成功 → 路由到对应剧本渲染
-                ApplyDecision(decision);
-                // 原始 stdout 仍写到 raw output（用户能看到 JSON 决策原始流）
+                // JSON 模式：info / error 处理成文字（info 亮黄、error 红）后进原始输出面板；
+                // decision 等未处理的 JSON 保留原样输出（走下方兜底）。
+                if (TryParseUmaAiInfo(line, out var infoEvent))
+                {
+                    processOutput.Writer.TryWrite(new($"info: {infoEvent}", applyToLegend, UmaAiMessageKind.Info));
+                    return;
+                }
+
+                if (TryParseUmaAiError(line, out var errorMessage))
+                {
+                    processOutput.Writer.TryWrite(new($"error: {errorMessage}", applyToLegend, UmaAiMessageKind.Error));
+                    return;
+                }
+
+                if (TryParseUmaAiDecision(line, out var decision))
+                {
+                    ApplyDecision(decision);
+                    var text = FormatDecisionText(decision);
+                    if (text.Count > 0)
+                    {
+                        foreach (var t in text)
+                            processOutput.Writer.TryWrite(new(t, applyToLegend, null));
+                        return;
+                    }
+                }
             }
 
-            // 非 JSON 行 / JSON 解析失败 / 兜底：原样写入 raw output channel
-            processOutput.Writer.TryWrite(new(line, applyToLegend));
+            // 兜底（含 decision / 未识别 JSON / 非 JSON 模式 / 解析失败）：原样写入，
+            // 在原始输出面板以默认色展示，用户始终能看到 AI 子进程的完整 stdout 流。
+            processOutput.Writer.TryWrite(new(line, applyToLegend, null));
         }
 
-        /// 尝试解析 UmaAI `--json` 模式输出的一行决策 JSON
+        /// 尝试解析 UmaAI `--json` 模式输出的一行 `decision` JSON
         ///
-        /// 详见集成文档 §3.2.6 / §4.3：以 `schema_version` 字段作为协议标记。
-        /// 解析失败（缺字段 / 非 JSON / 旧版 stdout）一律返回 `false`，不抛异常。
+        /// 2026-09 协议：以顶层 `type: "decision"` 作为消息类型标记（与 Rust 端
+        /// `StdoutJsonSink::emit` 对齐）。解析失败（缺字段 / 非 JSON / type 不匹配）
+        /// 一律返回 `false`，不抛异常。
         internal static bool TryParseUmaAiDecision(string line, out UmaAiDecision decision)
         {
             decision = default;
@@ -163,19 +188,149 @@ namespace AIRedirector
             {
                 using var doc = JsonDocument.Parse(line);
                 var root = doc.RootElement;
-                if (!root.TryGetProperty("schema_version", out _))
+                if (!root.TryGetProperty("type", out var typeProp)
+                    || typeProp.ValueKind != JsonValueKind.String
+                    || typeProp.GetString() != "decision")
                     return false;
 
                 var actionIndex = root.TryGetProperty("action_index", out var ai) ? ai.GetInt32() : -1;
                 var score = root.TryGetProperty("score", out var s) ? s.GetDouble() : 0.0;
                 var scenario = root.TryGetProperty("scenario", out var sc) ? sc.GetString() ?? "" : "";
                 var turn = root.TryGetProperty("turn", out var t) ? t.GetUInt32() : 0u;
-                string? reason = root.TryGetProperty("reason", out var r) && r.ValueKind != JsonValueKind.Null
-                    ? r.GetString()
-                    : null;
+                var decisionKind = root.TryGetProperty("decision_kind", out var dk)
+                    ? dk.GetString() ?? ""
+                    : "";
 
-                decision = new UmaAiDecision(actionIndex, score, scenario, turn, reason);
+                var candidateScores = ParseDoubleArray(root, "candidate_scores");
+                var candidateDescriptions = ParseStringArray(root, "candidate_descriptions");
+                var candidateN = ParseUIntArray(root, "candidate_n");
+
+                double? baseline = null, totalLuck = null, turnLuck = null;
+                if (root.TryGetProperty("scenario_extra", out var extra)
+                    && extra.ValueKind == JsonValueKind.Object)
+                {
+                    baseline = GetOptionalDouble(extra, "current_terminal_baseline");
+                    totalLuck = GetOptionalDouble(extra, "total_luck_score");
+                    turnLuck = GetOptionalDouble(extra, "last_turn_delta");
+                }
+
+                decision = new UmaAiDecision(
+                    actionIndex, score, scenario, turn, decisionKind,
+                    candidateScores, candidateDescriptions, candidateN,
+                    baseline, totalLuck, turnLuck);
                 return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static double? GetOptionalDouble(JsonElement obj, string name)
+        {
+            if (!obj.TryGetProperty(name, out var prop) || prop.ValueKind != JsonValueKind.Number)
+                return null;
+
+            return prop.GetDouble();
+        }
+
+        static double[] ParseDoubleArray(JsonElement root, string name)
+        {
+            if (!root.TryGetProperty(name, out var arr) || arr.ValueKind != JsonValueKind.Array)
+                return [];
+
+            var values = new List<double>(arr.GetArrayLength());
+            foreach (var item in arr.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.Number)
+                    values.Add(item.GetDouble());
+            }
+
+            return values.ToArray();
+        }
+
+        static string[] ParseStringArray(JsonElement root, string name)
+        {
+            if (!root.TryGetProperty(name, out var arr) || arr.ValueKind != JsonValueKind.Array)
+                return [];
+
+            var values = new List<string>(arr.GetArrayLength());
+            foreach (var item in arr.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String)
+                    values.Add(item.GetString() ?? "");
+            }
+
+            return values.ToArray();
+        }
+
+        static uint[] ParseUIntArray(JsonElement root, string name)
+        {
+            if (!root.TryGetProperty(name, out var arr) || arr.ValueKind != JsonValueKind.Array)
+                return [];
+
+            var values = new List<uint>(arr.GetArrayLength());
+            foreach (var item in arr.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.Number)
+                    values.Add(item.GetUInt32());
+            }
+
+            return values.ToArray();
+        }
+
+        /// 尝试解析 UmaAI `--json` 模式输出的一行 `info` JSON
+        ///
+        /// 已知 event 取值（与 Rust 端 `StdoutJsonSink::emit_info` 对齐）：
+        /// - `connected`：AI 子进程已连接并就绪
+        /// - `compute_start`：收到新回合 JSON、开始计算
+        /// - `compute_next_step`：链式决策中间步骤
+        /// - `new_game`：检测到切局 / 新一局
+        ///
+        /// 解析失败（非 JSON / 缺字段 / type 不为 `info` / event 为 null）一律返回 `false`。
+        internal static bool TryParseUmaAiInfo(string line, [NotNullWhen(true)] out string? infoEvent)
+        {
+            infoEvent = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("type", out var typeProp)
+                    || typeProp.ValueKind != JsonValueKind.String
+                    || typeProp.GetString() != "info")
+                    return false;
+
+                infoEvent = root.TryGetProperty("event", out var e) && e.ValueKind != JsonValueKind.Null
+                    ? e.GetString()
+                    : null;
+                return infoEvent is not null;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// 尝试解析 UmaAI `--json` 模式输出的一行 `error` JSON
+        ///
+        /// 按 Rust 端约定：只带 `message` 字符串，错误事件不细分类型。
+        /// 解析失败（非 JSON / 缺字段 / type 不为 `error` / message 为 null）一律返回 `false`。
+        internal static bool TryParseUmaAiError(string line, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? errorMessage)
+        {
+            errorMessage = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("type", out var typeProp)
+                    || typeProp.ValueKind != JsonValueKind.String
+                    || typeProp.GetString() != "error")
+                    return false;
+
+                errorMessage = root.TryGetProperty("message", out var m) && m.ValueKind != JsonValueKind.Null
+                    ? m.GetString()
+                    : null;
+                return errorMessage is not null;
             }
             catch
             {
@@ -185,16 +340,76 @@ namespace AIRedirector
 
         /// 路由到对应剧本的 UI 渲染
         ///
-        /// **Step 8 占位**：当前仅在诊断输出记录决策——实际 UI 渲染（黑板 / 小黑板）待
-        /// 后续步骤按 `scenario` 路由到具体实现。原始 stdout 已写到 raw output workspace
-        /// （用户始终能看到 AI 决策原始 JSON 流），不影响此处渲染职责。
+        /// 当前仅在诊断输出记录决策（`FormatDecisionText` 已负责屏幕上的可读文本渲染）。
+        /// 实际 UI 渲染（黑板 / 小黑板）待后续步骤按 `scenario` 路由到具体实现。
         void ApplyDecision(UmaAiDecision decision)
         {
             Trace.WriteLine(
                 $"UmaAi 决策 [scenario={decision.Scenario} turn={decision.Turn} " +
-                $"action={decision.ActionIndex} score={decision.Score:F0}]" +
-                (decision.Reason is { } r ? $" reason={r}" : ""));
+                $"kind={decision.DecisionKind} action={decision.ActionIndex} score={decision.Score:F0}]");
         }
+
+        /// 把一条 decision 格式化为可读的多行文本（供公共面板逐行输出）。
+        ///
+        /// 内容顺序按需求：首选动作 → #2-#5 备选动作与说明 → 当前期望评分 → 运气分（本局/本回合）。
+        /// 只有 1 个候选（如手写逻辑选择）时只返回首选动作行。
+        static IReadOnlyList<string> FormatDecisionText(UmaAiDecision decision)
+        {
+            var primary = PrimaryDescription(decision);
+            var lines = new List<string> { $"首选: {primary}" };
+
+            // 候选总数取「描述数 / 评分数」较大者，用于判定是否单动作
+            var total = Math.Max(decision.CandidateDescriptions.Length, decision.CandidateScores.Length);
+
+            // 单动作（手写逻辑等）：只显示首选，跳过 #2-#5 与运气
+            if (total <= 1)
+                return lines;
+
+            // #2-#5：按评分降序排列备选（排除首选下标），最多取 4 个
+            var primaryIndex = decision.ActionIndex >= 0 && decision.ActionIndex < decision.CandidateDescriptions.Length
+                ? decision.ActionIndex
+                : -1;
+            var alternatives = Enumerable.Range(0, decision.CandidateDescriptions.Length)
+                .Where(i => i != primaryIndex)
+                .Select(i => (Index: i, Desc: decision.CandidateDescriptions[i],
+                    Score: i < decision.CandidateScores.Length ? decision.CandidateScores[i] : (double?)null))
+                .OrderByDescending(x => x.Score ?? double.MinValue)
+                .Take(4)
+                .Select((x, k) => x.Score is { } sc
+                    ? $"#{k + 2} {x.Desc}({sc:F0})"
+                    : $"#{k + 2} {x.Desc}")
+                .ToList();
+
+            if (alternatives.Count > 0)
+                lines.Add(string.Join(" | ", alternatives));
+
+            lines.Add(
+                $"期望评分 {FormatRound(decision.CurrentTerminalBaseline)} " +
+                $"运气: 本局 {FormatSignedRound(decision.TotalLuckScore)} " +
+                $"本回合 {FormatSignedRound(decision.LastTurnDelta)}");
+
+            return lines;
+        }
+
+        /// 首选动作的可读描述：优先取 `action_index` 对应描述，缺省退到候选第 0 项，再无则显示下标。
+        static string PrimaryDescription(UmaAiDecision decision)
+        {
+            if (decision.ActionIndex >= 0 && decision.ActionIndex < decision.CandidateDescriptions.Length)
+                return decision.CandidateDescriptions[decision.ActionIndex];
+
+            if (decision.CandidateDescriptions.Length >= 1)
+                return decision.CandidateDescriptions[0];
+
+            return $"动作#{decision.ActionIndex}";
+        }
+
+        /// 期望评分：保留整数（四舍五入），无值显示 `--`。
+        static string FormatRound(double? value)
+            => value is { } v ? Math.Round(v).ToString("F0") : "--";
+
+        /// 运气分：带正负号（如 `+12` / `-3`），首回合无本回合运气时显示 `--`。
+        static string FormatSignedRound(double? value)
+            => value is { } v ? $"{v:+0;-0;0}" : "--";
 
         async ValueTask ConsumeProcessOutputAsync(CancellationToken cancellationToken)
         {
@@ -202,7 +417,12 @@ namespace AIRedirector
             {
                 await foreach (var output in processOutput.Reader.ReadAllAsync(cancellationToken))
                 {
-                    if (!rawOutput.PublishLine(output.Line) ||
+                    var published = output.Kind is { } kind
+                        ? kind == UmaAiMessageKind.Info
+                            ? rawOutput.PublishInfo(output.Line!)
+                            : rawOutput.PublishError(output.Line!)
+                        : rawOutput.PublishLine(output.Line);
+                    if (!published ||
                         !output.ApplyToLegend ||
                         !Volatile.Read(ref gameStarted) ||
                         string.IsNullOrEmpty(output.Line) ||
@@ -324,7 +544,7 @@ namespace AIRedirector
                 {
                     ConfigAction.EditUaf => ("UAF", draft.UAF_Path),
                     ConfigAction.EditCook => ("Cook", draft.Cook_Path),
-                    ConfigAction.EditMecha => ("Mecha", config.Mecha_Path),
+                    ConfigAction.EditMecha => ("Mecha", draft.Mecha_Path),
                     ConfigAction.EditLegend => ("Legend", draft.Legend_Path),
                     ConfigAction.EditRamen => ("Ramen", draft.Ramen_Path),
                     _ => throw new UnreachableException(),
@@ -536,7 +756,7 @@ namespace AIRedirector
                 throw failure;
         }
 
-        readonly record struct ProcessOutput(string? Line, bool ApplyToLegend);
+        readonly record struct ProcessOutput(string? Line, bool ApplyToLegend, UmaAiMessageKind? Kind);
     }
 
     internal interface ILegendAiOutputBridge : IDisposable
@@ -548,16 +768,23 @@ namespace AIRedirector
 
     /// AIRedirector 解析后的 UmaAI 决策（详见集成文档 §3.2.6 / §4.3）
     ///
-    /// 与 Rust 端 `StdoutJsonSink` 输出 schema 对齐：
-    /// - `schema_version`（int）已识别
-    /// - `action_index`（int）/ `score`（f64）/ `scenario`（str）/ `turn`（u32）
-    ///   / `reason`（str?）按 JSON 字段填充
-    /// - `candidate_n` / `candidate_scores` / `scenario_extra` 暂不解析
-    ///   （Step 8 路由需求外，原始 stdout 已写到 raw output）
+    /// 与 Rust 端 `StdoutJsonSink` 输出 schema 对齐（2026-09 协议）：
+    /// - 顶层 `type: "decision"` 作为消息类型标记
+    /// - `action_index` / `score` / `scenario` / `turn` / `decision_kind`
+    /// - `candidate_scores` / `candidate_descriptions` / `candidate_n`：所有候选
+    ///   的评分 / 可读描述 / 样本数（**完整保留**，用于屏幕输出 #2-#5 备选）
+    /// - `scenario_extra.current_terminal_baseline`：当前期望评分
+    /// - `scenario_extra.total_luck_score` / `last_turn_delta`：本局 / 本回合运气分
     internal readonly record struct UmaAiDecision(
         int ActionIndex,
         double Score,
         string Scenario,
         uint Turn,
-        string? Reason);
+        string DecisionKind,
+        double[] CandidateScores,
+        string[] CandidateDescriptions,
+        uint[] CandidateN,
+        double? CurrentTerminalBaseline,
+        double? TotalLuckScore,
+        double? LastTurnDelta);
 }

@@ -12,11 +12,15 @@ manifest 将 `LegendScenarioAnalyzer` 声明为软联动。共享插件上下文
 
 ## 构建
 
-仓库通过 Git submodule 固定 Host 与 Legend 源码。克隆后在仓库根执行：
+仓库通过 NuGet 包引用 Host API，通过 Git submodule 固定 Legend 源码。克隆后在仓库根执行：
 
 ```powershell
 git -c core.longpaths=true submodule update --init --recursive
 dotnet build .\AIRedirector.csproj -c Release -m:1 -p:RuntimeIdentifier=win-x64 -p:SelfContained=false -p:PlatformTarget=AnyCPU -p:DeployUraPluginToLocalAppDataOnBuild=false
-$uraHostProject = (Resolve-Path .\deps\UmamusumeResponseAnalyzer\UmamusumeResponseAnalyzer\UmamusumeResponseAnalyzer.csproj).Path
-dotnet run --project .\tests\AIRedirectorSmoke\AIRedirectorSmoke.csproj -c Release -p:UraHostProjectPath="$uraHostProject" -p:GenerateUraPluginManifestOnBuild=false -p:PackageUraPluginOnBuild=false -p:DeployUraPluginToLocalAppDataOnBuild=false
 ```
+
+Host-dependent smoke 位于 `tests/AIRedirectorSmoke`。
+
+## 验证与发布
+
+在 Windows 仓库根执行 `act workflow_dispatch --artifact-server-path "$env:TEMP/ura-act-artifacts"`。本地与 GitHub 使用同一份 workflow；版本 tag 触发 GitHub Release 发布。环境要求、共用 workflow 本地映射和发布规则见 [URA plugin workflows](https://github.com/URA-Plugins/.github/blob/v1/README.md)。

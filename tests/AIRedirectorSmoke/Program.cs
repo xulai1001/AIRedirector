@@ -33,13 +33,18 @@ await TestLegendBuffSelectionOutputUsesObtainableBuffContext(ui);
 TestTryParseUmaAiDecisionAcceptsRamenJsonLine();
 TestTryParseUmaAiDecisionAcceptsOnsenJsonLine();
 TestTryParseUmaAiDecisionRejectsNonJsonLine();
-TestTryParseUmaAiDecisionRejectsJsonWithoutSchemaVersion();
+TestTryParseUmaAiDecisionRejectsJsonWithoutTypeDecision();
+TestTryParseUmaAiInfoAcceptsAllFourEvents();
+TestTryParseUmaAiErrorAcceptsChineseMessage();
+TestTryParseUmaAiErrorAcceptsEnglishMessage();
+TestTryParseUmaAiDecisionRejectsInfoLine();
+TestTryParseUmaAiInfoRejectsErrorLine();
 
 Console.WriteLine("PASS AIRedirector smoke");
 
 static void AssertProjectMetadata()
 {
-    var projectPath = Path.Combine(FindRepositoryRoot(), "AIRedirector", "AIRedirector.csproj");
+    var projectPath = Path.Combine(FindRepositoryRoot(), "AIRedirector.csproj");
     var project = File.ReadAllText(projectPath);
     if (!project.Contains("<PluginDependencies>LegendScenarioAnalyzer</PluginDependencies>", StringComparison.Ordinal))
         throw new InvalidOperationException("AIRedirector manifest metadata must depend on LegendScenarioAnalyzer.");
@@ -723,20 +728,8 @@ static string CapturePanel(WorkspaceSmokeSession ui, Workspace workspace, int wi
 }
 
 static string FindRepositoryRoot()
-{
-    foreach (var startPath in new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory })
-    {
-        for (var directory = new DirectoryInfo(startPath);
-             directory is not null;
-             directory = directory.Parent)
-        {
-            if (File.Exists(Path.Combine(directory.FullName, "AIRedirector", "AIRedirector.csproj")))
-                return directory.FullName;
-        }
-    }
-
-    throw new InvalidOperationException("Could not locate URA-Plugins repository root.");
-}
+    => Environment.GetEnvironmentVariable("URA_TEST_PLUGIN_ROOT")
+       ?? throw new InvalidOperationException("URA_TEST_PLUGIN_ROOT must identify the plugin checkout.");
 
 static void RequireEqual<T>(T expected, T actual, string name)
 {
@@ -1032,32 +1025,44 @@ sealed class TerminalGuiSmokeApp : IDisposable
 }
 
 // ===========================================================================
-// UmaAI --json 决策解析（Step 8）
+// UmaAI --json 解析（Step 8 + 2026-09 三类型扩展）
+//
+// 2026-09 协议升级：顶层 `type` 字段（`decision` / `info` / `error`）替代原
+// `schema_version` 协议标记。HandleOutput 按 type 分发到 ApplyDecision /
+// ApplyInfo / ApplyError（Trace 占位）。原始 stdout 仍写到 raw output workspace。
 // ===========================================================================
 
-/// 解析合法的拉面剧本决策 JSON：scenario="ramen"，完整字段透传
+/// 解析合法的拉面剧本决策 JSON：scenario="ramen"，新协议完整字段透传
 static void TestTryParseUmaAiDecisionAcceptsRamenJsonLine()
 {
-    const string line = """{"schema_version":1,"turn":42,"scenario":"ramen","action_index":3,"score":56712.3,"candidate_scores":[56712.3,56100.5,55234.1],"candidate_n":[1024,800,256],"reason":"vs #2 智+180 PT-33"}""";
+    const string line = """{"type":"decision","turn":42,"scenario":"ramen","action_index":0,"score":56712.3,"decision_kind":"ramen_select","candidate_scores":[56712.3,56100.5,55234.1],"candidate_descriptions":["吃面A","训练/耐","智力","速度"],"candidate_n":[1024,800,256,512],"scenario_extra":{"current_terminal_baseline":56000.0,"total_luck_score":712.3,"last_turn_delta":-3.5}}""";
     if (!AIRedirector.AIRedirector.TryParseUmaAiDecision(line, out var decision))
         throw new InvalidOperationException("拉面 JSON 行应解析成功");
-    if (decision.ActionIndex != 3) throw new InvalidOperationException($"action_index={decision.ActionIndex}");
+    if (decision.ActionIndex != 0) throw new InvalidOperationException($"action_index={decision.ActionIndex}");
     if (decision.Score is not (> 56712.0 and < 56712.5)) throw new InvalidOperationException($"score={decision.Score}");
     if (decision.Scenario != "ramen") throw new InvalidOperationException($"scenario={decision.Scenario}");
     if (decision.Turn != 42) throw new InvalidOperationException($"turn={decision.Turn}");
-    if (decision.Reason != "vs #2 智+180 PT-33") throw new InvalidOperationException($"reason={decision.Reason}");
+    if (decision.DecisionKind != "ramen_select") throw new InvalidOperationException($"decision_kind={decision.DecisionKind}");
+    if (decision.CandidateDescriptions.Length != 4) throw new InvalidOperationException($"candidate_descriptions 长度={decision.CandidateDescriptions.Length}");
+    if (decision.CandidateN.Length != 4) throw new InvalidOperationException($"candidate_n 长度={decision.CandidateN.Length}");
+    if (decision.CurrentTerminalBaseline != 56000.0) throw new InvalidOperationException($"current_terminal_baseline={decision.CurrentTerminalBaseline}");
+    if (decision.TotalLuckScore != 712.3) throw new InvalidOperationException($"total_luck_score={decision.TotalLuckScore}");
+    if (decision.LastTurnDelta != -3.5) throw new InvalidOperationException($"last_turn_delta={decision.LastTurnDelta}");
 }
 
-/// 解析温泉剧本决策 JSON：scenario="onsen"，reason 可空
+/// 解析温泉剧本决策 JSON：scenario="onsen"，scenario_extra / 候选缺失时运气字段为 null
 static void TestTryParseUmaAiDecisionAcceptsOnsenJsonLine()
 {
-    const string line = """{"schema_version":1,"turn":12,"scenario":"onsen","action_index":0,"score":54321.0}""";
+    const string line = """{"type":"decision","turn":12,"scenario":"onsen","action_index":0,"score":54321.0}""";
     if (!AIRedirector.AIRedirector.TryParseUmaAiDecision(line, out var decision))
         throw new InvalidOperationException("温泉 JSON 行应解析成功");
     if (decision.ActionIndex != 0) throw new InvalidOperationException($"action_index={decision.ActionIndex}");
     if (decision.Scenario != "onsen") throw new InvalidOperationException($"scenario={decision.Scenario}");
     if (decision.Turn != 12) throw new InvalidOperationException($"turn={decision.Turn}");
-    if (decision.Reason is not null) throw new InvalidOperationException($"reason 应为 null，得到 {decision.Reason}");
+    if (decision.CandidateDescriptions.Length != 0) throw new InvalidOperationException($"candidate_descriptions 应为空");
+    if (decision.CurrentTerminalBaseline is not null) throw new InvalidOperationException($"current_terminal_baseline 应为 null");
+    if (decision.TotalLuckScore is not null) throw new InvalidOperationException($"total_luck_score 应为 null");
+    if (decision.LastTurnDelta is not null) throw new InvalidOperationException($"last_turn_delta 应为 null");
 }
 
 /// 玩家模式 stdout 行（非 JSON）应被拒绝，不抛异常
@@ -1068,10 +1073,59 @@ static void TestTryParseUmaAiDecisionRejectsNonJsonLine()
         throw new InvalidOperationException("非 JSON 行应被拒绝");
 }
 
-/// 旧版 stdout JSON（无 schema_version）应被拒绝
-static void TestTryParseUmaAiDecisionRejectsJsonWithoutSchemaVersion()
+/// 旧版 / 缺 type 字段的 JSON 应被拒绝（避免误识别）
+static void TestTryParseUmaAiDecisionRejectsJsonWithoutTypeDecision()
 {
     const string line = """{"turn":5,"scenario":"onsen","action_index":1,"score":1000.0}""";
     if (AIRedirector.AIRedirector.TryParseUmaAiDecision(line, out _))
-        throw new InvalidOperationException("缺 schema_version 的 JSON 应被拒绝");
+        throw new InvalidOperationException("缺 type 字段的 JSON 应被拒绝");
+}
+
+/// info 行（含 4 种已知 event）应被识别
+static void TestTryParseUmaAiInfoAcceptsAllFourEvents()
+{
+    foreach (var expected in new[] { "connected", "compute_start", "compute_next_step", "new_game" })
+    {
+        var line = $$"""{"type":"info","event":"{{expected}}"}""";
+        if (!AIRedirector.AIRedirector.TryParseUmaAiInfo(line, out var infoEvent))
+            throw new InvalidOperationException($"info 行应解析成功: event={expected}");
+        if (infoEvent != expected)
+            throw new InvalidOperationException($"info event 不匹配: 期望 {expected}, 得到 {infoEvent}");
+    }
+}
+
+/// error 行（中文 message）应被识别
+static void TestTryParseUmaAiErrorAcceptsChineseMessage()
+{
+    const string line = """{"type":"error","message":"小黑板目录不存在"}""";
+    if (!AIRedirector.AIRedirector.TryParseUmaAiError(line, out var errorMessage))
+        throw new InvalidOperationException("error 行应解析成功");
+    if (errorMessage != "小黑板目录不存在")
+        throw new InvalidOperationException($"error message 不匹配: 得到 {errorMessage}");
+}
+
+/// error 行（英文 / 含特殊字符 message）应被识别
+static void TestTryParseUmaAiErrorAcceptsEnglishMessage()
+{
+    const string line = """{"type":"error","message":"parse failed: bad json"}""";
+    if (!AIRedirector.AIRedirector.TryParseUmaAiError(line, out var errorMessage))
+        throw new InvalidOperationException("error 行应解析成功");
+    if (errorMessage != "parse failed: bad json")
+        throw new InvalidOperationException($"error message 不匹配: 得到 {errorMessage}");
+}
+
+/// info 行不应被 decision 解析器误识别（避免 type 字段互窜）
+static void TestTryParseUmaAiDecisionRejectsInfoLine()
+{
+    const string line = """{"type":"info","event":"connected"}""";
+    if (AIRedirector.AIRedirector.TryParseUmaAiDecision(line, out _))
+        throw new InvalidOperationException("info 行不应被 decision 解析器识别");
+}
+
+/// error 行不应被 info 解析器误识别
+static void TestTryParseUmaAiInfoRejectsErrorLine()
+{
+    const string line = """{"type":"error","message":"x"}""";
+    if (AIRedirector.AIRedirector.TryParseUmaAiInfo(line, out _))
+        throw new InvalidOperationException("error 行不应被 info 解析器识别");
 }
