@@ -1,8 +1,10 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using Terminal.Gui;
 using Terminal.Gui.Drawing;
 using Terminal.Gui.Text;
 using Terminal.Gui.ViewBase;
+using Terminal.Gui.Views;
 using UmamusumeResponseAnalyzer.TerminalGui;
 
 namespace AIRedirector;
@@ -35,6 +37,15 @@ internal sealed class UmaAiRawOutputWorkspace : IDisposable
     readonly List<UmaAiDisplayLine> lines = [];
     Workspace? workspace;
 
+    /// 面板底部按钮「重启AI进程」的回调（由 AIRedirector 注入；为 null 时不显示该按钮）。
+    public Action? RestartRequested { get; set; }
+
+    /// 面板底部按钮「删除回合数据」的回调（由 AIRedirector 注入；为 null 时不显示该按钮）。
+    public Action? DeleteTurnDataRequested { get; set; }
+
+    /// 面板底部按钮「独立窗口运行AI」的回调（由 AIRedirector 注入；为 null 时不显示该按钮）。
+    public Action? RunInSeparateWindowRequested { get; set; }
+
     public bool PublishLine(string? line)
     {
         if (line is null)
@@ -63,7 +74,7 @@ internal sealed class UmaAiRawOutputWorkspace : IDisposable
         target.SetPanel(
             PanelKey,
             PanelTitle,
-            new WorkspaceContent(() => new UmaAiDisplayView(LineSnapshot())),
+            new WorkspaceContent(() => new UmaAiDisplayView(LineSnapshot(), RestartRequested, DeleteTurnDataRequested, RunInSeparateWindowRequested)),
             fullBleed: true,
             switchToWorkspace: false);
         workspace = target;
@@ -109,21 +120,45 @@ internal sealed class UmaAiRawOutputWorkspace : IDisposable
     }
 }
 
-/// <summary>以「新消息在底部」的滚动方式绘制该面板：info 亮黄、error 红、其余默认色。</summary>
+/// <summary>
+/// 以「新消息在底部」的滚动方式绘制该面板：info 亮黄、error 红、其余默认色；
+/// 底部保留一行按钮条，提供「重启AI进程」「删除回合数据」「独立窗口运行AI」三个可点击操作。
+/// </summary>
 internal sealed class UmaAiDisplayView : View
 {
-    readonly UmaAiDisplayLine[] lines;
+    const int ButtonBarHeight = 1;
 
-    public UmaAiDisplayView(UmaAiDisplayLine[] lines)
+    /// <summary>面板底部预留的空行数，避免与宿主底部任务栏重叠（窗口高度之上再扣掉这些行，底部留白）。</summary>
+    const int BottomReserved = 2;
+
+    readonly UmaAiDisplayLine[] lines;
+    readonly Button restartButton;
+    readonly Button deleteButton;
+    readonly Button runSeparateButton;
+
+    public UmaAiDisplayView(UmaAiDisplayLine[] lines, Action? onRestart, Action? onDelete, Action? onRunSeparate)
     {
         this.lines = lines;
-        CanFocus = false;
+        CanFocus = true;
+        TabStop = TabBehavior.TabGroup;
+
+        restartButton = new Button { Text = "重启AI进程" };
+        if (onRestart is not null)
+            restartButton.Accepting += (_, _) => onRestart();
+        deleteButton = new Button { Text = "删除回合数据" };
+        if (onDelete is not null)
+            deleteButton.Accepting += (_, _) => onDelete();
+        runSeparateButton = new Button { Text = "独立窗口运行AI" };
+        if (onRunSeparate is not null)
+            runSeparateButton.Accepting += (_, _) => onRunSeparate();
+        Add(restartButton, deleteButton, runSeparateButton);
     }
 
     protected override bool OnDrawingContent(DrawContext? context)
     {
+        // 文本区高度 = 视口高度 - 底部按钮条 - 底部留白（避开宿主任务栏）
         var width = Viewport.Width;
-        var height = Viewport.Height;
+        var height = Math.Max(0, Viewport.Height - ButtonBarHeight - BottomReserved);
         var start = Math.Max(0, lines.Length - height);
         var normal = GetAttributeForRole(VisualRole.Normal);
 
@@ -137,6 +172,18 @@ internal sealed class UmaAiDisplayView : View
 
         context?.AddDrawnRectangle(ViewportToScreen());
         return true;
+    }
+
+    protected override void OnSubViewLayout(LayoutEventArgs args)
+    {
+        var barY = Math.Max(0, Viewport.Height - BottomReserved - ButtonBarHeight);
+        restartButton.X = 1;
+        restartButton.Y = barY;
+        deleteButton.X = Pos.Right(restartButton) + 2;
+        deleteButton.Y = restartButton.Y;
+        runSeparateButton.X = Pos.Right(deleteButton) + 2;
+        runSeparateButton.Y = restartButton.Y;
+        base.OnSubViewLayout(args);
     }
 
     static Terminal.Gui.Drawing.Attribute? KindAttribute(UmaAiMessageKind kind)

@@ -9,6 +9,7 @@ using Terminal.Gui.App;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using UmamusumeResponseAnalyzer.Plugin;
+using UmamusumeResponseAnalyzer.TerminalGui;
 
 namespace AIRedirector
 {
@@ -29,8 +30,16 @@ namespace AIRedirector
         ChildProcessManager? _childProcessManager;
         AIRedirectorConfig config = new();
         ILegendAiOutputBridge? legendOutput;
+        IRamenAiOutputBridge? ramenOutput;
         readonly UmaAiRawOutputWorkspace rawOutput = new();
         bool gameStarted;
+        readonly SemaphoreSlim processLock = new(1, 1);
+
+        // 单选约束：当前只激活一个 AI，操作全部围绕选中的那一个进行。
+        string? selectedAiName;
+        string? selectedAiPath;
+        bool selectedAiAppliesToLegend;
+        bool selectedAiJsonMode;
 
         string ConfigPath => Path.Combine(DataDirectory, "settings.json");
 
@@ -40,61 +49,40 @@ namespace AIRedirector
             {
                 Directory.CreateDirectory(DataDirectory);
                 config = AIRedirectorConfig.Load(ConfigPath);
+                SyncSelectedAiFromConfig();
+                // 面板底部操作按钮：重启 AI 进程 / 删除回合数据 / 独立窗口运行 AI
+                rawOutput.RestartRequested = RestartAllProcesses;
+                rawOutput.DeleteTurnDataRequested = DeleteTurnDataAndNotify;
+                rawOutput.RunInSeparateWindowRequested = RunInSeparateWindow;
                 context.Events.OnStarted(_ =>
                 {
                     Volatile.Write(ref gameStarted, true);
                     return ValueTask.CompletedTask;
                 });
                 context.RunBackground(ConsumeProcessOutputAsync);
-                /*
+                
                 if (context.IsPluginAvailable("LegendScenarioAnalyzer"))
                 {
                     legendOutput = CreateLegendOutputBridge();
                     RegisterLegendDisplayIdAnalyzers(context);
                 }
-                */
-                var sendGameStatusDataDirectory = Path.Combine("PluginData", "SendGameStatusPlugin");
-                if (Directory.Exists(sendGameStatusDataDirectory))
+
+                if (context.IsPluginAvailable("RamenScenarioAnalyzer"))
                 {
-                    foreach (var i in Directory.EnumerateFiles(sendGameStatusDataDirectory, "*.json", SearchOption.AllDirectories))
-                    {
-                        if (Path.GetFileName(i) == "thisTurn.json")
-                        {
-                            File.WriteAllText(i, "{}");
-                        }
-                    }
+                    ramenOutput = CreateRamenOutputBridge();
+                    RegisterRamenDisplayIdAnalyzers(context);
                 }
 
-                ValidateConfiguredPath("UAF", config.UAF, config.UAF_Path);
-                ValidateConfiguredPath("Cook", config.Cook, config.Cook_Path);
-                ValidateConfiguredPath("Mecha", config.Mecha, config.Mecha_Path);
-                ValidateConfiguredPath("Legend", config.Legend, config.Legend_Path);
-                ValidateConfiguredPath("Ramen", config.Ramen, config.Ramen_Path);
+                ValidateConfiguredPath(selectedAiName, selectedAiPath);
 
-                if (config.UAF)
-                    Trace.WriteLine($"UAF Path: {config.UAF_Path}");
-                if (config.Cook)
-                    Trace.WriteLine($"Cook Path: {config.Cook_Path}");
-                if (config.Mecha)
-                    Trace.WriteLine($"Mecha Path: {config.Mecha_Path}");
-                if (config.Legend)
-                    Trace.WriteLine($"Legend Path: {config.Legend_Path}");
-                if (config.Ramen)
-                    Trace.WriteLine($"Ramen Path: {config.Ramen_Path}");
+                if (selectedAiName is not null)
+                    Trace.WriteLine($"{selectedAiName} Path: {selectedAiPath}");
 
                 var manager = new ChildProcessManager();
                 _childProcessManager = manager;
 
-                if (config.UAF)
-                    StartProcess(manager, "UAF", config.UAF_Path);
-                if (config.Cook)
-                    StartProcess(manager, "Cook", config.Cook_Path);
-                if (config.Mecha)
-                    StartProcess(manager, "Mecha", config.Mecha_Path);
-                if (config.Legend)
-                    StartProcess(manager, "Legend", config.Legend_Path, applyToLegend: true);
-                if (config.Ramen)
-                    StartProcess(manager, "Ramen", config.Ramen_Path, jsonMode: true);
+                if (selectedAiName is not null)
+                    StartProcess(manager, selectedAiName, selectedAiPath!, selectedAiAppliesToLegend, selectedAiJsonMode);
             }
             catch (Exception initializationException)
             {
@@ -112,6 +100,19 @@ namespace AIRedirector
 
                 throw;
             }
+        }
+
+        /// 单选约束：从当前配置解析被选中的那一个 AI（名字 / 路径 / 输出标志），
+        /// 其它 AI 一律不参与启动 / 重启等 binary 操作。
+        void SyncSelectedAiFromConfig()
+        {
+            (selectedAiName, selectedAiPath, selectedAiAppliesToLegend, selectedAiJsonMode) =
+                config.UAF ? ("UAF", config.UAF_Path, false, false)
+                : config.Cook ? ("Cook", config.Cook_Path, false, false)
+                : config.Mecha ? ("Mecha", config.Mecha_Path, false, false)
+                : config.Legend ? ("Legend", config.Legend_Path, true, false)
+                : config.Ramen ? ("Ramen", config.Ramen_Path, false, true)
+                : (null, null, false, false);
         }
 
         void StartProcess(
@@ -135,6 +136,167 @@ namespace AIRedirector
 
             manager.AddProcess(process);
             process.BeginOutputReadLine();
+            LogToHost($"已启动 {name} AI: {path}");
+        }
+
+        /// 向宿主（UmamusumeResponseAnalyzer）日志面板写入一条提示。
+        ///
+        /// 宿主尚未准备好时（如离线 smoke、非 UI 上下文）静默跳过，绝不因日志失败而
+        /// 中断 AI 进程的启动流程。
+        internal static void LogToHost(string text)
+        {
+            try
+            {
+                TerminalUi.Log("[AIRedirector]", text);
+            }
+            catch (Exception)
+            {
+                // 宿主 UI 不可用：忽略提示，AI 进程照常拉起。
+            }
+        }
+
+        /// <summary>面板按钮触发的「重启 AI 进程」：杀光现有子进程后按当前配置重建全部剧本。</summary>
+        /// <remarks>在后台线程执行以避免 Kill/WaitForExit 阻塞 UI；与其它重启互斥（快速失败）。</remarks>
+        void RestartAllProcesses()
+        {
+            if (!processLock.Wait(0))
+            {
+                rawOutput.PublishInfo("已有一次 AI 重启进行中，已忽略本次点击。");
+                return;
+            }
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    var started = startedProcesses.ToArray();
+                    foreach (var process in started)
+                    {
+                        if (!process.HasExited)
+                            process.Kill();
+                    }
+
+                    foreach (var process in started)
+                        process.WaitForExit(ProcessExitWaitMilliseconds);
+
+                    startedProcesses.Clear();
+
+                    var manager = _childProcessManager ?? new ChildProcessManager();
+                    _childProcessManager = manager;
+                    if (selectedAiName is not null)
+                        StartProcess(manager, selectedAiName, selectedAiPath!, selectedAiAppliesToLegend, selectedAiJsonMode);
+
+                    rawOutput.PublishInfo(selectedAiName is null ? "已重启 AI 进程。" : $"已重启 {selectedAiName} AI 进程。");
+                    LogToHost(selectedAiName is null ? "已重启 AI 进程。" : $"已重启 {selectedAiName} AI 进程。");
+                    Volatile.Read(ref ramenOutput)?.Notify(selectedAiName is null ? "已重启 AI 进程。" : $"已重启 {selectedAiName} AI 进程。");
+                }
+                catch (Exception ex)
+                {
+                    rawOutput.PublishError($"重启 AI 进程失败: {ex.Message}");
+                    LogToHost($"重启 AI 进程失败: {ex.Message}");
+                    Volatile.Read(ref ramenOutput)?.Notify($"重启 AI 进程失败: {ex.Message}", isError: true);
+                }
+                finally
+                {
+                    processLock.Release();
+                }
+            });
+        }
+
+        /// <summary>面板按钮触发的「在独立窗口运行AI」：终止当前受控 AI 进程（脱离插件控制），
+        /// 再于新控制台窗口重新启动它——不带 --json，恢复 AI 正常的彩色 + 横幅显示模式。</summary>
+        /// <remarks>与重启一致：后台线程执行避免阻塞 UI，与其它进程操作互斥（快速失败）。
+        /// 新进程不加入 Job Object / 不受插件管理，插件退出时也不受影响。</remarks>
+        void RunInSeparateWindow()
+        {
+            if (!processLock.Wait(0))
+            {
+                rawOutput.PublishInfo("已有一次 AI 进程操作进行中，已忽略本次点击。");
+                return;
+            }
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    var name = selectedAiName;
+                    var path = selectedAiPath;
+                    if (name is null || string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                    {
+                        rawOutput.PublishInfo("未启用 AI 或配置的程序路径不存在，无法在独立窗口运行。");
+                        return;
+                    }
+
+                    // (1) 终止当前受插件控制的 AI 进程，先脱离插件控制。
+                    var started = startedProcesses.ToArray();
+                    foreach (var process in started)
+                    {
+                        if (!process.HasExited)
+                            process.Kill();
+                    }
+                    foreach (var process in started)
+                        process.WaitForExit(ProcessExitWaitMilliseconds);
+                    startedProcesses.Clear();
+
+                    // (2) 在新控制台窗口重新启动 AI（不带 --json），不再交给插件 / Job Object 管理。
+                    var fullPath = Path.GetFullPath(path);
+                    var workingDirectory = Path.GetDirectoryName(fullPath)
+                        ?? throw new ArgumentException($"无法解析 UmaAI 程序所在目录: {path}", nameof(path));
+                    var startInfo = new ProcessStartInfo
+                    {
+                        FileName = fullPath,
+                        WorkingDirectory = workingDirectory,
+                        UseShellExecute = true,
+                        CreateNoWindow = false,
+                        WindowStyle = ProcessWindowStyle.Normal,
+                    };
+                    // 只为拿到启动结果：Dispose 只释放本地句柄，不影响新窗口里的进程继续运行。
+                    using (Process.Start(startInfo))
+                    {
+                    }
+
+                    var message = $"已终止 {name} AI 并在独立窗口重启（不带 --json，恢复正常显示）。";
+                    rawOutput.PublishInfo(message);
+                    LogToHost(message);
+                }
+                catch (Exception ex)
+                {
+                    rawOutput.PublishError($"在独立窗口运行 AI 失败: {ex.Message}");
+                    LogToHost($"在独立窗口运行 AI 失败: {ex.Message}");
+                }
+                finally
+                {
+                    processLock.Release();
+                }
+            });
+        }
+
+        /// <summary>面板按钮触发的「删除回合数据」：只删除 .portable/PluginData/SendGameStatusPlugin/thisTurn.json 并提醒回主界面重新进入育成。</summary>
+        void DeleteTurnDataAndNotify()
+        {
+            try
+            {
+                var turnDataFile = Path.Combine("PluginData", "SendGameStatusPlugin", "thisTurn.json");
+                var removed = false;
+                if (File.Exists(turnDataFile))
+                {
+                    File.Delete(turnDataFile);
+                    removed = true;
+                }
+
+                var message = removed
+                    ? "已删除回合数据文件 thisTurn.json。请从主页重新进入育成。"
+                    : "未找到回合数据文件 thisTurn.json（请确认是否已开始育成）。";
+                rawOutput.PublishInfo(message);
+                LogToHost(message);
+                Volatile.Read(ref ramenOutput)?.Notify(message);
+            }
+            catch (Exception ex)
+            {
+                rawOutput.PublishError($"删除回合数据失败: {ex.Message}");
+                LogToHost($"删除回合数据失败: {ex.Message}");
+                Volatile.Read(ref ramenOutput)?.Notify($"删除回合数据失败: {ex.Message}", isError: true);
+            }
         }
 
         void HandleOutput(string? line, bool applyToLegend, bool jsonMode = false)
@@ -162,12 +324,15 @@ namespace AIRedirector
                 {
                     ApplyDecision(decision);
                     var text = FormatDecisionText(decision);
-                    if (text.Count > 0)
-                    {
-                        foreach (var t in text)
-                            processOutput.Writer.TryWrite(new(t, applyToLegend, null));
+                    if (text.Count == 0)
                         return;
-                    }
+
+                    // 原始放入公共面板逐行展示。
+                    foreach (var t in text)
+                        processOutput.Writer.TryWrite(new(t, applyToLegend, null));
+                    // 同时把原始 JSON 行交给各分析器桥（Ramen 桥需要 JSON 才能解析 target 与文本）。
+                    processOutput.Writer.TryWrite(new(line, applyToLegend, null));
+                    return;
                 }
             }
 
@@ -347,13 +512,20 @@ namespace AIRedirector
             Trace.WriteLine(
                 $"UmaAi 决策 [scenario={decision.Scenario} turn={decision.Turn} " +
                 $"kind={decision.DecisionKind} action={decision.ActionIndex} score={decision.Score:F0}]");
+            if (decision.Scenario != "ramen")
+                return;
+
+            // 方案(1)：把拉面 AI 决策经宿主日志面板展示（与「已启动 Ramen AI」同一条
+            // TerminalUi.Log 通道），即使反射桥 / Extra / AI 面板不可用也能保证用户可见。
+            foreach (var line in FormatDecisionText(decision))
+                LogToHost($"拉面AI: {line}");
         }
 
         /// 把一条 decision 格式化为可读的多行文本（供公共面板逐行输出）。
         ///
         /// 内容顺序按需求：首选动作 → #2-#5 备选动作与说明 → 当前期望评分 → 运气分（本局/本回合）。
         /// 只有 1 个候选（如手写逻辑选择）时只返回首选动作行。
-        static IReadOnlyList<string> FormatDecisionText(UmaAiDecision decision)
+        internal static IReadOnlyList<string> FormatDecisionText(UmaAiDecision decision)
         {
             var primary = PrimaryDescription(decision);
             var lines = new List<string> { $"首选: {primary}" };
@@ -422,16 +594,23 @@ namespace AIRedirector
                             ? rawOutput.PublishInfo(output.Line!)
                             : rawOutput.PublishError(output.Line!)
                         : rawOutput.PublishLine(output.Line);
-                    if (!published ||
-                        !output.ApplyToLegend ||
-                        !Volatile.Read(ref gameStarted) ||
-                        string.IsNullOrEmpty(output.Line) ||
-                        Volatile.Read(ref legendOutput) is not { } bridge ||
-                        !bridge.ProcessLine(output.Line))
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!published || !Volatile.Read(ref gameStarted) || string.IsNullOrEmpty(output.Line))
                         continue;
 
-                    cancellationToken.ThrowIfCancellationRequested();
-                    _ = bridge.ApplyTargetDisplay(cancellationToken);
+                    // 各分析器桥自行过滤各自关心的行并决定是否刷新目标面板。
+                    if (output.ApplyToLegend &&
+                        Volatile.Read(ref legendOutput) is { } legend &&
+                        legend.ProcessLine(output.Line))
+                    {
+                        _ = legend.ApplyTargetDisplay(cancellationToken);
+                    }
+
+                    if (Volatile.Read(ref ramenOutput) is { } ramen &&
+                        ramen.ProcessLine(output.Line))
+                    {
+                        _ = ramen.ApplyTargetDisplay(cancellationToken);
+                    }
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -445,18 +624,18 @@ namespace AIRedirector
             }
         }
 
-        static void ValidateConfiguredPath(string name, bool enabled, string path)
+        static void ValidateConfiguredPath(string? name, string? path)
         {
-            if (!enabled)
+            if (name is null)
                 return;
 
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
                 throw new FileNotFoundException($"{name} AI 已启用，但配置的程序路径不存在: {path}", path);
         }
-        /*
+        
         [MethodImpl(MethodImplOptions.NoInlining)]
         static ILegendAiOutputBridge CreateLegendOutputBridge() => new LegendAiOutputBuffer();
-        */
+        
         void RegisterLegendDisplayIdAnalyzers(IPluginContext context)
         {
             context.Analyzers.Register<SingleModeLegendCheckEventResponse>(
@@ -480,6 +659,38 @@ namespace AIRedirector
             if (chara is not null)
             {
                 Volatile.Read(ref legendOutput)?.SetTarget(
+                    chara.single_mode_chara_id,
+                    chara.turn);
+            }
+            return ValueTask.CompletedTask;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static IRamenAiOutputBridge CreateRamenOutputBridge() => new RamenAiOutputBuffer();
+
+        void RegisterRamenDisplayIdAnalyzers(IPluginContext context)
+        {
+            context.Analyzers.Register<SingleModeRamenExecCommandResponse>(
+                AnalyzerKind.Response,
+                [
+                    EndpointPattern.Regex(
+                        "/umamusume/single_mode_ramen/(?:change_short_cut|check_event|check_point|continue|exec_command|finish_claw_crane|gain_skills|race_end|race_entry|race_out|ramen_live|uraf_effect_apply|select_region)")
+                ],
+                invocation => SetRamenDisplayId(invocation.Payload.data?.chara_info),
+                priority: 0);
+            context.Analyzers.Register<SingleModeRamenLoadResponse>(
+                AnalyzerKind.Response,
+                [EndpointPattern.Exact("/umamusume/single_mode_ramen/load")],
+                invocation => SetRamenDisplayId(
+                    invocation.Payload.data?.single_mode_load_common?.chara_info),
+                priority: 0);
+        }
+
+        ValueTask SetRamenDisplayId(SingleModeChara? chara)
+        {
+            if (chara is not null)
+            {
+                Volatile.Read(ref ramenOutput)?.SetTarget(
                     chara.single_mode_chara_id,
                     chara.turn);
             }
@@ -524,6 +735,8 @@ namespace AIRedirector
             cancellationToken.ThrowIfCancellationRequested();
             saved.Save(ConfigPath);
             config = saved;
+            // 单选：保存后重新解析当前选中的 AI，使后续启动 / 重启围绕新选择进行。
+            SyncSelectedAiFromConfig();
         }
 
         static AIRedirectorConfig RunConfigDialog(
@@ -591,6 +804,8 @@ namespace AIRedirector
             };
             var action = ConfigAction.Cancel;
             var items = new List<MenuItem>();
+            // 场景开关为单选：勾选某一项时其它项自动取消
+            var scenarioBoxes = new List<CheckBox>();
 
             void AddScenario(
                 string name,
@@ -603,6 +818,7 @@ namespace AIRedirector
                 {
                     Text = $"启用 {name}",
                     Value = enabled ? CheckState.Checked : CheckState.UnChecked,
+                    RadioStyle = true,
                     CanFocus = false,
                 };
                 var pathItem = new MenuItem
@@ -619,9 +835,19 @@ namespace AIRedirector
                 checkBox.ValueChanged += (_, _) =>
                 {
                     var isEnabled = checkBox.Value == CheckState.Checked;
+                    // 单选互斥：勾选本项时取消其它已勾选项（其它项的 ValueChanged 幂等安全）
+                    if (isEnabled)
+                    {
+                        foreach (var other in scenarioBoxes)
+                        {
+                            if (other != checkBox && other.Value == CheckState.Checked)
+                                other.Value = CheckState.UnChecked;
+                        }
+                    }
                     setEnabled(isEnabled);
                     pathItem.Visible = isEnabled;
                 };
+                scenarioBoxes.Add(checkBox);
                 items.Add(new MenuItem { CommandView = checkBox });
                 items.Add(pathItem);
             }
@@ -690,6 +916,7 @@ namespace AIRedirector
         {
             _ = processOutput.Writer.TryComplete();
             var legendBridge = Interlocked.Exchange(ref legendOutput, null);
+            var ramenBridge = Interlocked.Exchange(ref ramenOutput, null);
             var started = startedProcesses.ToArray();
             startedProcesses.Clear();
             var created = createdProcesses.ToArray();
@@ -746,6 +973,8 @@ namespace AIRedirector
                     Capture(manager.Dispose);
                 if (legendBridge is not null)
                     Capture(legendBridge.Dispose);
+                if (ramenBridge is not null)
+                    Capture(ramenBridge.Dispose);
                 Capture(rawOutput.Dispose);
             }
 
@@ -764,6 +993,16 @@ namespace AIRedirector
         bool ProcessLine(string? rawLine);
         void SetTarget(int singleModeCharaId, int turn);
         bool ApplyTargetDisplay(CancellationToken cancellationToken);
+    }
+
+    internal interface IRamenAiOutputBridge : IDisposable
+    {
+        bool ProcessLine(string? rawLine);
+        void SetTarget(int singleModeCharaId, int turn);
+        bool ApplyTargetDisplay(CancellationToken cancellationToken);
+
+        /// <summary>在 AI 面板打印一行用户操作提示（如「已重启 AI 进程」）；isError 用红色渲染。</summary>
+        void Notify(string message, bool isError = false);
     }
 
     /// AIRedirector 解析后的 UmaAI 决策（详见集成文档 §3.2.6 / §4.3）
